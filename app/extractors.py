@@ -511,11 +511,6 @@ def extract_docx(filepath):
                 )
             fn_html = ' ' + ' '.join(fn_tags)
 
-        # Wrap html in alignment div if needed
-        full_html = f'{num_prefix}{html}{field_html}{comment_html}{fn_html}{image_html}'
-        if alignment and alignment != 'left':
-            full_html = f'<div style="text-align:{alignment}">{full_html}</div>'
-
         # Build image text markers for enriched text and HTML
         image_text_parts = []
         image_html = ''
@@ -527,6 +522,11 @@ def extract_docx(filepath):
                 for it in image_text_parts
             )
             image_html = f' {img_tags}'
+
+        # Wrap html in alignment div if needed
+        full_html = f'{num_prefix}{html}{field_html}{comment_html}{fn_html}{image_html}'
+        if alignment and alignment != 'left':
+            full_html = f'<div style="text-align:{alignment}">{full_html}</div>'
 
         # Build enriched plain text for comparison (includes field info, comments, footnotes, images)
         enriched_text = text
