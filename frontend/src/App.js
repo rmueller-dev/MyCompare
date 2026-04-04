@@ -104,7 +104,7 @@ function DownloadButtons({ docId, versionA, versionB, fileType, latestVersionId 
   return (
     <div className="bg-white border rounded-xl p-4 mb-4">
       <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wider mb-3">Herunterladen</h3>
-      <div className="flex flex-wrap gap-3">
+      <div className="flex flex-wrap gap-2 mb-2">
         {/* Original format */}
         <a href={`${API}/export-changes/${docId}/${versionA}/${versionB}?format=original`}
           className={`${btnBase} ${typeColors[fileType] || 'bg-gray-600 hover:bg-gray-700 text-white'}`}
@@ -156,7 +156,8 @@ function DownloadButtons({ docId, versionA, versionB, fileType, latestVersionId 
             Metadaten entfernen
           </a>
         )}
-
+      </div>
+      <div className="flex flex-wrap gap-2">
         {/* Changed pages/sections only - Word (green) */}
         <a href={`${API}/export-changed-pages-only/${docId}/${versionA}/${versionB}?format=original`}
           className={`${btnBase} bg-green-600 hover:bg-green-700 text-white`}
