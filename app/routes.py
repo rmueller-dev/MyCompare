@@ -2951,78 +2951,25 @@ def _export_changed_pages_pdf(filepath_a, filepath_b, tmpdir, output_format):
 def _export_changed_paragraphs_docx(filepath_a, filepath_b, tmpdir,
                                      output_format):
     """
-    Generate a DOCX redline, then extract only paragraphs that contain
-    tracked changes (w:ins or w:del elements), with 1 paragraph of context
-    before and after each changed paragraph.
+    Export changes between two DOCX versions.
+    - Word format: Returns the full redline DOCX with tracked changes
+      (complete pages, not just extracted paragraphs).
+    - PDF format: Generates a reportlab-based redline PDF with change markup
+      (works on all platforms without LibreOffice).
     """
-    from docx import Document as DocxDocument
-    from lxml import etree
-    import copy
-
-    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-    # First generate the full redline
-    redline_path = _generate_docx_redline(filepath_a, filepath_b, tmpdir)
-
-    # Open the redline and find paragraphs with changes
-    redline_doc = DocxDocument(redline_path)
-    body = redline_doc.element.body
-    all_paras = list(body.iterchildren(f'{{{W}}}p'))
-    total = len(all_paras)
-
-    # Find indices of paragraphs that contain w:ins or w:del
-    changed_indices = set()
-    for i, para in enumerate(all_paras):
-        if (para.findall(f'.//{{{W}}}ins')
-                or para.findall(f'.//{{{W}}}del')):
-            changed_indices.add(i)
-
-    if not changed_indices:
+    if output_format == 'pdf':
+        # Use reportlab-based PDF generation (no LibreOffice needed)
+        # Determine file_type from the file extension
+        ext = os.path.splitext(filepath_b)[1].lower().lstrip('.')
+        file_type = ext if ext in ('docx', 'xlsx', 'pptx', 'pdf', 'txt') else 'docx'
+        pdf_path = _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir)
+        if pdf_path and os.path.exists(pdf_path):
+            return pdf_path
         return None
 
-    # Add context: 1 paragraph before and after each changed paragraph
-    with_context = set()
-    for idx in changed_indices:
-        with_context.add(idx)
-        if idx > 0:
-            with_context.add(idx - 1)
-        if idx < total - 1:
-            with_context.add(idx + 1)
-
-    # Build new document with only the selected paragraphs
-    out_doc = DocxDocument()
-    try:
-        out_doc.element.body.clear()
-    except Exception:
-        pass
-
-    sorted_indices = sorted(with_context)
-    prev_idx = -2
-
-    for idx in sorted_indices:
-        # Insert visual separator when there is a gap
-        if idx > prev_idx + 1 and prev_idx >= 0:
-            sep_para = etree.SubElement(out_doc.element.body, f'{{{W}}}p')
-            sep_run = etree.SubElement(sep_para, f'{{{W}}}r')
-            sep_rpr = etree.SubElement(sep_run, f'{{{W}}}rPr')
-            sep_color = etree.SubElement(sep_rpr, f'{{{W}}}color')
-            sep_color.set(f'{{{W}}}val', '999999')
-            sep_t = etree.SubElement(sep_run, f'{{{W}}}t')
-            sep_t.text = '\u2014 [...] \u2014'
-
-        new_para = copy.deepcopy(all_paras[idx])
-        out_doc.element.body.append(new_para)
-        prev_idx = idx
-
-    out_path = os.path.join(tmpdir, 'changed_paragraphs.docx')
-    out_doc.save(out_path)
-
-    if output_format == 'pdf':
-        pdf_path = _convert_docx_to_pdf(out_path, tmpdir)
-        if pdf_path:
-            return pdf_path
-
-    return out_path
+    # Word format: return the full redline DOCX with all tracked changes
+    redline_path = _generate_docx_redline(filepath_a, filepath_b, tmpdir)
+    return redline_path
 
 
 def _convert_docx_to_pdf(docx_path, tmpdir):
@@ -3352,8 +3299,125 @@ def multi_compare():
     finally:
         import threading
 
-        def cleanup():
+        def cleanup_multi():
             import time
             time.sleep(10)
             shutil.rmtree(tmpdir, ignore_errors=True)
-        threading.Thread(target=cleanup, daemon=True).start()
+        threading.Thread(target=cleanup_multi, daemon=True).start()
+
+
+# ─── AI Analysis (Ollama) ───────────────────────────────────────────────
+
+@api.route('/ai/status', methods=['GET'])
+def ai_status():
+    """Check if Ollama is running and which models are available."""
+    available, models = _check_ollama()
+    return jsonify({
+        'available': available,
+        'models': models,
+    })
+
+
+@api.route('/ai/analyze/<int:doc_id>/<int:version_a>/<int:version_b>',
+           methods=['POST'])
+def ai_analyze(doc_id, version_a, version_b):
+    """
+    Generate an AI-powered issue list from the changes between two versions.
+    Requires JSON body: { "client_party": "Käufer" }
+    Optional: { "model": "llama3.1", "document_context": "Kaufvertrag" }
+    """
+    data = request.get_json() or {}
+    client_party = data.get('client_party', '').strip()
+    if not client_party:
+        return jsonify({
+            'error': 'Bitte geben Sie an, wen Sie vertreten (client_party).'
+        }), 400
+
+    model = data.get('model')
+    document_context = data.get('document_context', '')
+
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        if not doc:
+            return jsonify({'error': 'Dokument nicht gefunden'}), 404
+
+        ver_a = session.query(Version).filter_by(
+            document_id=doc_id, version_number=version_a).first()
+        ver_b = session.query(Version).filter_by(
+            document_id=doc_id, version_number=version_b).first()
+        if not ver_a or not ver_b:
+            return jsonify({'error': 'Version nicht gefunden'}), 404
+
+        # Extract text and compute diff to get changes
+        struct_a, text_a = extract(ver_a.filepath, doc.file_type)
+        struct_b, text_b = extract(ver_b.filepath, doc.file_type)
+
+        import difflib
+        lines_a = text_a.splitlines()
+        lines_b = text_b.splitlines()
+        sm = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+
+        changes = []
+        para_num = 0
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == 'equal':
+                para_num += (i2 - i1)
+                continue
+            if tag == 'replace':
+                for idx in range(max(i2 - i1, j2 - j1)):
+                    para_num += 1
+                    old = lines_a[i1 + idx] if (i1 + idx) < i2 else ''
+                    new = lines_b[j1 + idx] if (j1 + idx) < j2 else ''
+                    if old and new:
+                        changes.append({'type': 'Geändert', 'old': old[:300],
+                                        'new': new[:300], 'para': para_num})
+                    elif old:
+                        changes.append({'type': 'Gelöscht', 'old': old[:300],
+                                        'new': '', 'para': para_num})
+                    else:
+                        changes.append({'type': 'Eingefügt', 'old': '',
+                                        'new': new[:300], 'para': para_num})
+            elif tag == 'delete':
+                for idx in range(i1, i2):
+                    para_num += 1
+                    changes.append({'type': 'Gelöscht',
+                                    'old': lines_a[idx][:300],
+                                    'new': '', 'para': para_num})
+            elif tag == 'insert':
+                for idx in range(j1, j2):
+                    para_num += 1
+                    changes.append({'type': 'Eingefügt', 'old': '',
+                                    'new': lines_b[idx][:300],
+                                    'para': para_num})
+
+        if not changes:
+            return jsonify({
+                'status': 'ok',
+                'analysis': 'Keine Änderungen gefunden.',
+                'change_count': 0,
+            })
+
+        # Limit to 100 changes to keep prompt manageable
+        truncated = len(changes) > 100
+        analysis_changes = changes[:100]
+
+        result = analyze_changes(
+            analysis_changes,
+            client_party=client_party,
+            document_context=document_context or doc.name,
+            model=model,
+        )
+
+        if truncated:
+            result['truncated'] = True
+            result['total_changes'] = len(changes)
+
+        return jsonify(result)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
