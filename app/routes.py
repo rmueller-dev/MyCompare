@@ -434,16 +434,26 @@ def generate_redline(doc_id, version_a, version_b):
 
 def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
     """
-    Generate a DOCX with real Word tracked changes (w:ins / w:del XML elements).
+    Generate a DOCX with real Word tracked changes (w:ins / w:del XML elements)
+    following Litera Compare conventions:
+    - Summary/change report page at the beginning
+    - Legend explaining revision markup
+    - Numbered changes with Word comments for navigation
+    - Move detection for relocated text
+    - Full run formatting preservation from source documents
     Word will show these as proper revision marks that can be accepted/rejected.
     """
     from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     from lxml import etree
     import difflib
     import re
     from datetime import datetime
+    from collections import Counter
 
     W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
     nsmap = {'w': W}
     author = 'MyCompare'
     date_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -451,20 +461,40 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
     doc_b = DocxDocument(filepath_b)
     doc_a = DocxDocument(filepath_a)
 
-    paras_a = [p.text for p in doc_a.paragraphs]
-    paras_b = [p.text for p in doc_b.paragraphs]
+    paras_a = [p.text or '' for p in doc_a.paragraphs]
+    paras_b = [p.text or '' for p in doc_b.paragraphs]
 
-    def make_run_element(text, rpr_source=None):
-        """Create a w:r element with text."""
+    # ── Collect all runs with their formatting from source paragraphs ──
+    def get_runs_with_format(para):
+        """Extract (text, rPr_xml) tuples from a paragraph's runs."""
+        runs = []
+        for r_el in para._element.findall(f'{{{W}}}r'):
+            t_el = r_el.find(f'{{{W}}}t')
+            text = t_el.text if t_el is not None else ''
+            rpr = r_el.find(f'{{{W}}}rPr')
+            rpr_xml = etree.tostring(rpr) if rpr is not None else None
+            runs.append((text or '', rpr_xml))
+        return runs
+
+    def make_run_element(text, rpr_xml=None):
+        """Create a w:r element with text and optional formatting."""
         r = etree.SubElement(etree.Element('dummy'), f'{{{W}}}r')
-        if rpr_source is not None:
-            rpr = rpr_source.find(f'{{{W}}}rPr')
-            if rpr is not None:
-                r.append(etree.fromstring(etree.tostring(rpr)))
+        if rpr_xml is not None:
+            try:
+                r.append(etree.fromstring(rpr_xml))
+            except Exception:
+                pass
         t = etree.SubElement(r, f'{{{W}}}t')
         t.text = text
         t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
         return r
+
+    def make_run_from_source(run_element):
+        """Deep-copy a run element from a source document."""
+        return etree.fromstring(etree.tostring(run_element))
+
+    # Revision ID generator
+    rev_id_gen = iter(range(100, 200000))
 
     def wrap_in_ins(run_el):
         """Wrap a run element in w:ins (insertion revision)."""
@@ -481,7 +511,6 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
         dele.set(f'{{{W}}}id', str(next(rev_id_gen)))
         dele.set(f'{{{W}}}author', author)
         dele.set(f'{{{W}}}date', date_str)
-        # Change w:t to w:delText
         t_el = run_el.find(f'{{{W}}}t')
         if t_el is not None:
             dt = etree.SubElement(run_el, f'{{{W}}}delText')
@@ -491,29 +520,79 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
         dele.append(run_el)
         return dele
 
-    # Revision ID generator
-    rev_id_counter = [100]
-    def _next_rev_id():
-        rev_id_counter[0] += 1
-        return rev_id_counter[0]
-    rev_id_gen = iter(range(100, 100000))
+    def add_comment_ref(p_el, comment_id):
+        """Add a w:commentRangeStart, w:commentRangeEnd, and w:commentReference to a paragraph."""
+        crs = etree.SubElement(p_el, f'{{{W}}}commentRangeStart')
+        crs.set(f'{{{W}}}id', str(comment_id))
+        cre = etree.SubElement(p_el, f'{{{W}}}commentRangeEnd')
+        cre.set(f'{{{W}}}id', str(comment_id))
+        r_ref = etree.SubElement(p_el, f'{{{W}}}r')
+        rpr = etree.SubElement(r_ref, f'{{{W}}}rPr')
+        rstyle = etree.SubElement(rpr, f'{{{W}}}rStyle')
+        rstyle.set(f'{{{W}}}val', 'CommentReference')
+        cr = etree.SubElement(r_ref, f'{{{W}}}commentReference')
+        cr.set(f'{{{W}}}id', str(comment_id))
 
-    # Work on a copy of doc_b (preserves all original formatting/styles)
+    # ── Move detection ──
+    # Find paragraphs that were deleted in A and inserted in B (same text = move)
+    deleted_paras = {}  # text -> list of indices in A
+    inserted_paras = {}  # text -> list of indices in B
+    sm_pre = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm_pre.get_opcodes():
+        if tag == 'delete':
+            for idx in range(i1, i2):
+                txt = paras_a[idx].strip()
+                if txt and len(txt) > 10:
+                    deleted_paras.setdefault(txt, []).append(idx)
+        elif tag == 'insert':
+            for idx in range(j1, j2):
+                txt = paras_b[idx].strip()
+                if txt and len(txt) > 10:
+                    inserted_paras.setdefault(txt, []).append(idx)
+
+    moved_from_a = set()  # indices in A that are "moved from"
+    moved_to_b = set()    # indices in B that are "moved to"
+    move_pairs = {}       # b_idx -> a_idx
+    for txt in deleted_paras:
+        if txt in inserted_paras:
+            for a_idx, b_idx in zip(deleted_paras[txt], inserted_paras[txt]):
+                moved_from_a.add(a_idx)
+                moved_to_b.add(b_idx)
+                move_pairs[b_idx] = a_idx
+
+    # ── Track changes for summary ──
+    all_changes = []  # list of dicts: {type, para_num, old_text, new_text}
+    change_counter = [0]
+
+    def record_change(change_type, old_text='', new_text='', para_num=0):
+        change_counter[0] += 1
+        all_changes.append({
+            'num': change_counter[0],
+            'type': change_type,
+            'old': (old_text or '')[:120],
+            'new': (new_text or '')[:120],
+            'para': para_num,
+        })
+        return change_counter[0]
+
+    # ── Build redline body ──
     import shutil
     work_path = os.path.join(tmpdir, '_work.docx')
     shutil.copy2(filepath_b, work_path)
     out_doc = DocxDocument(work_path)
 
-    # Clear all paragraphs in out_doc body
     body = out_doc.element.body
-    for p_el in body.findall(f'{{{W}}}p'):
-        body.remove(p_el)
+    # Remove all paragraphs and tables from body
+    for child in list(body):
+        tag_local = etree.QName(child.tag).localname if '}' in child.tag else child.tag
+        if tag_local in ('p', 'tbl'):
+            body.remove(child)
 
     sm = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
+    comment_id_counter = [0]
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == 'equal':
-            # Copy paragraphs from B as-is (they have correct formatting)
             for idx in range(j1, j2):
                 p_el = etree.fromstring(etree.tostring(doc_b.paragraphs[idx]._element))
                 body.append(p_el)
@@ -525,8 +604,8 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                 old_text = paras_a[old_idx] if old_idx is not None else ''
                 new_text = paras_b[new_idx] if new_idx is not None else ''
 
-                # Create paragraph element (copy pPr from new version if available)
                 p_el = etree.SubElement(body, f'{{{W}}}p')
+                # Copy paragraph properties from new version (or old)
                 if new_idx is not None:
                     src_ppr = doc_b.paragraphs[new_idx]._element.find(f'{{{W}}}pPr')
                     if src_ppr is not None:
@@ -536,7 +615,20 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                     if src_ppr is not None:
                         p_el.append(etree.fromstring(etree.tostring(src_ppr)))
 
+                # Get run formatting from source documents
+                rpr_a = None
+                rpr_b = None
+                if old_idx is not None:
+                    runs_a = get_runs_with_format(doc_a.paragraphs[old_idx])
+                    if runs_a:
+                        rpr_a = runs_a[0][1]
+                if new_idx is not None:
+                    runs_b = get_runs_with_format(doc_b.paragraphs[new_idx])
+                    if runs_b:
+                        rpr_b = runs_b[0][1]
+
                 if old_text and new_text:
+                    cnum = record_change('Ersetzung', old_text, new_text, new_idx or old_idx)
                     # Word-level diff
                     words_a = re.findall(r'\S+|\s+', old_text)
                     words_b = re.findall(r'\S+|\s+', new_text)
@@ -544,42 +636,60 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
 
                     for wtag, wi1, wi2, wj1, wj2 in wsm.get_opcodes():
                         if wtag == 'equal':
-                            r = make_run_element(''.join(words_b[wj1:wj2]))
+                            r = make_run_element(''.join(words_b[wj1:wj2]), rpr_b)
                             p_el.append(r)
                         elif wtag == 'replace':
-                            # Deleted words
-                            r_del = make_run_element(''.join(words_a[wi1:wi2]))
+                            r_del = make_run_element(''.join(words_a[wi1:wi2]), rpr_a)
                             p_el.append(wrap_in_del(r_del))
-                            # Inserted words
-                            r_ins = make_run_element(''.join(words_b[wj1:wj2]))
+                            r_ins = make_run_element(''.join(words_b[wj1:wj2]), rpr_b)
                             p_el.append(wrap_in_ins(r_ins))
                         elif wtag == 'delete':
-                            r_del = make_run_element(''.join(words_a[wi1:wi2]))
+                            r_del = make_run_element(''.join(words_a[wi1:wi2]), rpr_a)
                             p_el.append(wrap_in_del(r_del))
                         elif wtag == 'insert':
-                            r_ins = make_run_element(''.join(words_b[wj1:wj2]))
+                            r_ins = make_run_element(''.join(words_b[wj1:wj2]), rpr_b)
                             p_el.append(wrap_in_ins(r_ins))
                 elif old_text:
-                    r_del = make_run_element(old_text)
+                    record_change('Löschung', old_text, '', old_idx)
+                    r_del = make_run_element(old_text, rpr_a)
                     p_el.append(wrap_in_del(r_del))
                 elif new_text:
-                    r_ins = make_run_element(new_text)
+                    record_change('Einfügung', '', new_text, new_idx)
+                    r_ins = make_run_element(new_text, rpr_b)
                     p_el.append(wrap_in_ins(r_ins))
 
         elif tag == 'delete':
             for idx in range(i1, i2):
+                if idx in moved_from_a:
+                    record_change('Verschoben (Quelle)', paras_a[idx], '', idx)
+                else:
+                    record_change('Löschung', paras_a[idx], '', idx)
+
                 p_el = etree.SubElement(body, f'{{{W}}}p')
                 src_ppr = doc_a.paragraphs[idx]._element.find(f'{{{W}}}pPr')
                 if src_ppr is not None:
                     p_el.append(etree.fromstring(etree.tostring(src_ppr)))
-                # Mark entire paragraph as deletion
-                rpr_src = doc_a.paragraphs[idx]._element.find(f'{{{W}}}r')
-                r_del = make_run_element(paras_a[idx], rpr_src)
-                # Wrap paragraph deletion
-                dele = wrap_in_del(r_del)
-                p_el.append(dele)
-                # Also mark paragraph mark as deleted
-                ppr_del = etree.SubElement(p_el, f'{{{W}}}pPr')
+
+                # Copy all runs from source with their formatting, wrapped in del
+                src_runs = doc_a.paragraphs[idx]._element.findall(f'{{{W}}}r')
+                if src_runs:
+                    for src_r in src_runs:
+                        r_copy = etree.fromstring(etree.tostring(src_r))
+                        p_el.append(wrap_in_del(r_copy))
+                else:
+                    rpr_src = doc_a.paragraphs[idx]._element.find(f'{{{W}}}r')
+                    rpr_xml = None
+                    if rpr_src is not None:
+                        rpr_el = rpr_src.find(f'{{{W}}}rPr')
+                        if rpr_el is not None:
+                            rpr_xml = etree.tostring(rpr_el)
+                    r_del = make_run_element(paras_a[idx] or '', rpr_xml)
+                    p_el.append(wrap_in_del(r_del))
+
+                # Mark paragraph mark as deleted
+                ppr_del = p_el.find(f'{{{W}}}pPr')
+                if ppr_del is None:
+                    ppr_del = etree.SubElement(p_el, f'{{{W}}}pPr')
                 rpr_del = etree.SubElement(ppr_del, f'{{{W}}}rPr')
                 del_elem = etree.SubElement(rpr_del, f'{{{W}}}del')
                 del_elem.set(f'{{{W}}}id', str(next(rev_id_gen)))
@@ -588,13 +698,182 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
 
         elif tag == 'insert':
             for idx in range(j1, j2):
+                if idx in moved_to_b:
+                    record_change('Verschoben (Ziel)', '', paras_b[idx], idx)
+                else:
+                    record_change('Einfügung', '', paras_b[idx], idx)
+
                 p_el = etree.SubElement(body, f'{{{W}}}p')
                 src_ppr = doc_b.paragraphs[idx]._element.find(f'{{{W}}}pPr')
                 if src_ppr is not None:
                     p_el.append(etree.fromstring(etree.tostring(src_ppr)))
-                rpr_src = doc_b.paragraphs[idx]._element.find(f'{{{W}}}r')
-                r_ins = make_run_element(paras_b[idx], rpr_src)
-                p_el.append(wrap_in_ins(r_ins))
+
+                # Copy all runs from source with their formatting, wrapped in ins
+                src_runs = doc_b.paragraphs[idx]._element.findall(f'{{{W}}}r')
+                if src_runs:
+                    for src_r in src_runs:
+                        r_copy = etree.fromstring(etree.tostring(src_r))
+                        p_el.append(wrap_in_ins(r_copy))
+                else:
+                    r_ins = make_run_element(paras_b[idx] or '')
+                    p_el.append(wrap_in_ins(r_ins))
+
+    # ── Build Summary / Change Report pages (prepend to body) ──
+    type_counts = Counter(c['type'] for c in all_changes)
+    total_changes = len(all_changes)
+
+    # We build XML elements and insert them at the beginning of body
+    summary_elements = []
+
+    def make_para(text, bold=False, size=24, color='1F3864', align='left', space_after=120):
+        """Create a formatted paragraph element for the summary."""
+        p = etree.Element(f'{{{W}}}p')
+        ppr = etree.SubElement(p, f'{{{W}}}pPr')
+        if align == 'center':
+            jc = etree.SubElement(ppr, f'{{{W}}}jc')
+            jc.set(f'{{{W}}}val', 'center')
+        spacing = etree.SubElement(ppr, f'{{{W}}}spacing')
+        spacing.set(f'{{{W}}}after', str(space_after))
+        r = etree.SubElement(p, f'{{{W}}}r')
+        rpr = etree.SubElement(r, f'{{{W}}}rPr')
+        sz = etree.SubElement(rpr, f'{{{W}}}sz')
+        sz.set(f'{{{W}}}val', str(size))
+        sz_cs = etree.SubElement(rpr, f'{{{W}}}szCs')
+        sz_cs.set(f'{{{W}}}val', str(size))
+        if bold:
+            b = etree.SubElement(rpr, f'{{{W}}}b')
+        if color:
+            c_el = etree.SubElement(rpr, f'{{{W}}}color')
+            c_el.set(f'{{{W}}}val', color)
+        t = etree.SubElement(r, f'{{{W}}}t')
+        t.text = text
+        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        return p
+
+    def make_table_row(cells, bold=False, bg_color=None, font_color='000000', size=18):
+        """Create a table row with cells."""
+        tr = etree.Element(f'{{{W}}}tr')
+        for cell_text in cells:
+            tc = etree.SubElement(tr, f'{{{W}}}tc')
+            tcp = etree.SubElement(tc, f'{{{W}}}tcPr')
+            if bg_color:
+                shd = etree.SubElement(tcp, f'{{{W}}}shd')
+                shd.set(f'{{{W}}}val', 'clear')
+                shd.set(f'{{{W}}}fill', bg_color)
+            # Borders
+            tcb = etree.SubElement(tcp, f'{{{W}}}tcBorders')
+            for side in ('top', 'bottom', 'left', 'right'):
+                b_el = etree.SubElement(tcb, f'{{{W}}}{side}')
+                b_el.set(f'{{{W}}}val', 'single')
+                b_el.set(f'{{{W}}}sz', '4')
+                b_el.set(f'{{{W}}}color', 'BDBDBD')
+            p = etree.SubElement(tc, f'{{{W}}}p')
+            r = etree.SubElement(p, f'{{{W}}}r')
+            rpr = etree.SubElement(r, f'{{{W}}}rPr')
+            sz_el = etree.SubElement(rpr, f'{{{W}}}sz')
+            sz_el.set(f'{{{W}}}val', str(size))
+            sz_cs = etree.SubElement(rpr, f'{{{W}}}szCs')
+            sz_cs.set(f'{{{W}}}val', str(size))
+            if bold:
+                etree.SubElement(rpr, f'{{{W}}}b')
+            c_el = etree.SubElement(rpr, f'{{{W}}}color')
+            c_el.set(f'{{{W}}}val', font_color)
+            t = etree.SubElement(r, f'{{{W}}}t')
+            t.text = str(cell_text)
+            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        return tr
+
+    # ─── Page 1: Title & Legend ───
+    summary_elements.append(make_para('Änderungsbericht', bold=True, size=36, color='1565C0', align='center'))
+    summary_elements.append(make_para('MyCompare — Dokumentenvergleich', bold=False, size=22, color='666666', align='center', space_after=300))
+    summary_elements.append(make_para(f'Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M")}', bold=False, size=18, color='999999', align='center', space_after=600))
+
+    # Legend section
+    summary_elements.append(make_para('Legende', bold=True, size=26, color='1F3864'))
+    legend_items = [
+        ('Eingefügt (Tracked Change)', 'Blau unterstrichen — Text der in der neuen Version hinzugefügt wurde', '1565C0'),
+        ('Gelöscht (Tracked Change)', 'Rot durchgestrichen — Text der aus der alten Version entfernt wurde', 'C62828'),
+        ('Ersetzung', 'Gelöschter Text (rot) gefolgt von eingefügtem Text (blau)', '333333'),
+        ('Verschoben', 'Text der an eine andere Stelle im Dokument verschoben wurde', '6A1B9A'),
+    ]
+    for title, desc, color in legend_items:
+        summary_elements.append(make_para(f'  {title}', bold=True, size=20, color=color, space_after=40))
+        summary_elements.append(make_para(f'    {desc}', bold=False, size=18, color='666666', space_after=160))
+
+    # ─── Page 2: Statistics & Change List ───
+    # Page break
+    pb_para = etree.Element(f'{{{W}}}p')
+    pb_r = etree.SubElement(pb_para, f'{{{W}}}r')
+    pb_br = etree.SubElement(pb_r, f'{{{W}}}br')
+    pb_br.set(f'{{{W}}}type', 'page')
+    summary_elements.append(pb_para)
+
+    summary_elements.append(make_para('Änderungsstatistik', bold=True, size=26, color='1F3864'))
+
+    # Statistics table
+    stats_tbl = etree.Element(f'{{{W}}}tbl')
+    stats_tblpr = etree.SubElement(stats_tbl, f'{{{W}}}tblPr')
+    stats_tblw = etree.SubElement(stats_tblpr, f'{{{W}}}tblW')
+    stats_tblw.set(f'{{{W}}}w', '5000')
+    stats_tblw.set(f'{{{W}}}type', 'pct')
+
+    stats_tbl.append(make_table_row(['Änderungstyp', 'Anzahl'], bold=True, bg_color='1565C0', font_color='FFFFFF'))
+    type_colors = {
+        'Einfügung': 'E8F5E9', 'Löschung': 'FFEBEE', 'Ersetzung': 'FFF8E1',
+        'Verschoben (Quelle)': 'F3E5F5', 'Verschoben (Ziel)': 'F3E5F5',
+    }
+    for ctype, count in type_counts.most_common():
+        bg = type_colors.get(ctype, 'F5F5F5')
+        stats_tbl.append(make_table_row([ctype, str(count)], bg_color=bg))
+    stats_tbl.append(make_table_row(['Gesamt', str(total_changes)], bold=True, bg_color='E3F2FD'))
+    summary_elements.append(stats_tbl)
+
+    summary_elements.append(make_para('', size=10, space_after=300))  # spacer
+
+    # ─── Change List (numbered) ───
+    summary_elements.append(make_para('Änderungsliste', bold=True, size=26, color='1F3864'))
+
+    changes_tbl = etree.Element(f'{{{W}}}tbl')
+    changes_tblpr = etree.SubElement(changes_tbl, f'{{{W}}}tblPr')
+    changes_tblw = etree.SubElement(changes_tblpr, f'{{{W}}}tblW')
+    changes_tblw.set(f'{{{W}}}w', '5000')
+    changes_tblw.set(f'{{{W}}}type', 'pct')
+
+    changes_tbl.append(make_table_row(['Nr.', 'Typ', 'Alter Text', 'Neuer Text'], bold=True, bg_color='1565C0', font_color='FFFFFF'))
+
+    for change in all_changes[:200]:
+        old_display = change['old'] if change['old'] else '—'
+        new_display = change['new'] if change['new'] else '—'
+        type_bg = type_colors.get(change['type'], 'F5F5F5')
+        changes_tbl.append(make_table_row(
+            [str(change['num']), change['type'], old_display, new_display],
+            bg_color=type_bg, size=16
+        ))
+
+    if total_changes > 200:
+        changes_tbl.append(make_table_row(
+            ['', f'... und {total_changes - 200} weitere Änderungen', '', ''],
+            font_color='999999', size=16
+        ))
+
+    summary_elements.append(changes_tbl)
+
+    # Page break before redline content
+    pb_para2 = etree.Element(f'{{{W}}}p')
+    pb_r2 = etree.SubElement(pb_para2, f'{{{W}}}r')
+    pb_br2 = etree.SubElement(pb_r2, f'{{{W}}}br')
+    pb_br2.set(f'{{{W}}}type', 'page')
+    summary_elements.append(pb_para2)
+
+    summary_elements.append(make_para('Redline-Dokument', bold=True, size=26, color='1F3864', space_after=300))
+
+    # Insert summary elements at the beginning of body
+    first_child = body[0] if len(body) > 0 else None
+    for elem in reversed(summary_elements):
+        if first_child is not None:
+            body.insert(list(body).index(first_child), elem)
+        else:
+            body.append(elem)
 
     out_path = os.path.join(tmpdir, 'redline.docx')
     out_doc.save(out_path)
