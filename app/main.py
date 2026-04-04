@@ -25,8 +25,17 @@ def create_app():
     @app.route('/<path:path>')
     def serve_frontend(path):
         if path and os.path.exists(os.path.join(frontend_dir, path)):
-            return send_from_directory(frontend_dir, path)
-        return send_from_directory(frontend_dir, 'index.html')
+            resp = send_from_directory(frontend_dir, path)
+            # Cache JS/CSS with hashed filenames forever, but not index.html
+            if path.startswith('static/'):
+                resp.cache_control.max_age = 31536000
+            return resp
+        resp = send_from_directory(frontend_dir, 'index.html')
+        # Never cache index.html so new builds are picked up immediately
+        resp.cache_control.no_cache = True
+        resp.cache_control.no_store = True
+        resp.cache_control.must_revalidate = True
+        return resp
 
     return app
 
