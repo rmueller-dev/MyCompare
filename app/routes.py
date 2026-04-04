@@ -861,6 +861,196 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                 add_bookmark(p_el, cnum)
                 body.append(p_el)
 
+
+    # ── Table-level comparison ──
+    tables_a = doc_a.tables
+    tables_b = doc_b.tables
+    num_tables = max(len(tables_a), len(tables_b))
+
+    def _wrap_all_runs_in_element_as_ins(element):
+        """Wrap all w:r elements inside an XML element tree with w:ins."""
+        runs_with_pos = []
+        for r_el in element.findall(f'.//{{{W}}}r'):
+            parent = r_el.getparent()
+            pos = list(parent).index(r_el)
+            runs_with_pos.append((parent, pos, r_el))
+        for parent, pos, r_el in reversed(runs_with_pos):
+            parent.remove(r_el)
+            ins_wrapper = wrap_in_ins(r_el)
+            parent.insert(pos, ins_wrapper)
+
+    def _wrap_all_runs_in_element_as_del(element):
+        """Wrap all w:r elements inside an XML element tree with w:del."""
+        runs_with_pos = []
+        for r_el in element.findall(f'.//{{{W}}}r'):
+            parent = r_el.getparent()
+            pos = list(parent).index(r_el)
+            runs_with_pos.append((parent, pos, r_el))
+        for parent, pos, r_el in reversed(runs_with_pos):
+            parent.remove(r_el)
+            del_wrapper = wrap_in_del(r_el)
+            parent.insert(pos, del_wrapper)
+
+    def _mark_row_paragraph_marks_deleted(tr_el):
+        """Mark paragraph marks in a row as deleted (w:pPr/w:rPr/w:del)."""
+        for p_el in tr_el.findall(f'.//{{{W}}}p'):
+            ppr = p_el.find(f'{{{W}}}pPr')
+            if ppr is None:
+                ppr = etree.SubElement(p_el, f'{{{W}}}pPr')
+            rpr = ppr.find(f'{{{W}}}rPr')
+            if rpr is None:
+                rpr = etree.SubElement(ppr, f'{{{W}}}rPr')
+            del_elem = etree.SubElement(rpr, f'{{{W}}}del')
+            del_elem.set(f'{{{W}}}id', str(next(rev_id_gen)))
+            del_elem.set(f'{{{W}}}author', author)
+            del_elem.set(f'{{{W}}}date', date_str)
+
+    for tbl_idx in range(num_tables):
+        tbl_a = tables_a[tbl_idx] if tbl_idx < len(tables_a) else None
+        tbl_b = tables_b[tbl_idx] if tbl_idx < len(tables_b) else None
+        tbl_label = f'Tabelle {tbl_idx + 1}'
+
+        if tbl_a is None and tbl_b is not None:
+            # Entire table is new (insertion)
+            record_change('Tabellenänderung', '', f'{tbl_label}: Gesamte Tabelle eingefügt', 0)
+            tbl_el = etree.fromstring(etree.tostring(tbl_b._tbl))
+            _wrap_all_runs_in_element_as_ins(tbl_el)
+            body.append(tbl_el)
+
+        elif tbl_b is None and tbl_a is not None:
+            # Entire table was deleted
+            record_change('Tabellenänderung', f'{tbl_label}: Gesamte Tabelle gelöscht', '', 0)
+            tbl_el = etree.fromstring(etree.tostring(tbl_a._tbl))
+            _wrap_all_runs_in_element_as_del(tbl_el)
+            for tr_el in tbl_el.findall(f'{{{W}}}tr'):
+                _mark_row_paragraph_marks_deleted(tr_el)
+            body.append(tbl_el)
+
+        else:
+            # Both tables exist - compare cell-by-cell
+            tbl_el = etree.fromstring(etree.tostring(tbl_b._tbl))
+
+            num_rows_a = len(tbl_a.rows)
+            num_rows_b = len(tbl_b.rows)
+
+            def _row_texts(table, n_rows):
+                """Get concatenated cell text per row for sequence matching."""
+                result = []
+                for ri in range(n_rows):
+                    cells_text = []
+                    for ci in range(len(table.rows[ri].cells)):
+                        cells_text.append(table.rows[ri].cells[ci].text or '')
+                    result.append('\t'.join(cells_text))
+                return result
+
+            rtexts_a = _row_texts(tbl_a, num_rows_a)
+            rtexts_b = _row_texts(tbl_b, num_rows_b)
+
+            row_sm = difflib.SequenceMatcher(None, rtexts_a, rtexts_b, autojunk=False)
+            row_opcodes = row_sm.get_opcodes()
+
+            # Remove all existing tr elements from the cloned table
+            for existing_tr in list(tbl_el.findall(f'{{{W}}}tr')):
+                tbl_el.remove(existing_tr)
+
+            for rtag, ri1, ri2, rj1, rj2 in row_opcodes:
+                if rtag == 'equal':
+                    for offset in range(rj2 - rj1):
+                        a_ri = ri1 + offset
+                        b_ri = rj1 + offset
+                        row_b_obj = tbl_b.rows[b_ri]
+                        row_a_obj = tbl_a.rows[a_ri]
+                        tr_el = etree.fromstring(etree.tostring(row_b_obj._tr))
+                        tc_els = tr_el.findall(f'{{{W}}}tc')
+
+                        num_cells_a = len(row_a_obj.cells)
+                        num_cells_b = len(row_b_obj.cells)
+
+                        for ci in range(min(num_cells_a, num_cells_b)):
+                            text_a = row_a_obj.cells[ci].text or ''
+                            text_b = row_b_obj.cells[ci].text or ''
+                            if text_a != text_b and ci < len(tc_els):
+                                record_change(
+                                    'Tabellenänderung', text_a, text_b, 0)
+
+                                tc_el = tc_els[ci]
+                                for p_existing in list(tc_el.findall(f'{{{W}}}p')):
+                                    tc_el.remove(p_existing)
+
+                                p_el = etree.SubElement(tc_el, f'{{{W}}}p')
+
+                                rpr_a_xml = None
+                                rpr_b_xml = None
+                                for p_src in row_a_obj.cells[ci].paragraphs:
+                                    runs_src = get_runs_with_format(p_src)
+                                    if runs_src:
+                                        rpr_a_xml = runs_src[0][1]
+                                        break
+                                for p_src in row_b_obj.cells[ci].paragraphs:
+                                    runs_src = get_runs_with_format(p_src)
+                                    if runs_src:
+                                        rpr_b_xml = runs_src[0][1]
+                                        break
+
+                                words_a = re.findall(r'\S+|\s+', text_a)
+                                words_b = re.findall(r'\S+|\s+', text_b)
+                                wsm = difflib.SequenceMatcher(
+                                    None, words_a, words_b, autojunk=False)
+
+                                for wtag, wi1, wi2, wj1, wj2 in wsm.get_opcodes():
+                                    if wtag == 'equal':
+                                        r_run = make_run_element(
+                                            ''.join(words_b[wj1:wj2]), rpr_b_xml)
+                                        p_el.append(r_run)
+                                    elif wtag == 'replace':
+                                        r_del = make_run_element(
+                                            ''.join(words_a[wi1:wi2]), rpr_a_xml)
+                                        p_el.append(wrap_in_del(r_del))
+                                        r_ins = make_run_element(
+                                            ''.join(words_b[wj1:wj2]), rpr_b_xml)
+                                        p_el.append(wrap_in_ins(r_ins))
+                                    elif wtag == 'delete':
+                                        r_del = make_run_element(
+                                            ''.join(words_a[wi1:wi2]), rpr_a_xml)
+                                        p_el.append(wrap_in_del(r_del))
+                                    elif wtag == 'insert':
+                                        r_ins = make_run_element(
+                                            ''.join(words_b[wj1:wj2]), rpr_b_xml)
+                                        p_el.append(wrap_in_ins(r_ins))
+
+                        tbl_el.append(tr_el)
+
+                elif rtag == 'replace':
+                    for idx in range(ri1, ri2):
+                        tr_el = etree.fromstring(etree.tostring(tbl_a.rows[idx]._tr))
+                        _wrap_all_runs_in_element_as_del(tr_el)
+                        _mark_row_paragraph_marks_deleted(tr_el)
+                        record_change('Tabellenänderung', rtexts_a[idx][:120], '', 0)
+                        tbl_el.append(tr_el)
+
+                    for idx in range(rj1, rj2):
+                        tr_el = etree.fromstring(etree.tostring(tbl_b.rows[idx]._tr))
+                        _wrap_all_runs_in_element_as_ins(tr_el)
+                        record_change('Tabellenänderung', '', rtexts_b[idx][:120], 0)
+                        tbl_el.append(tr_el)
+
+                elif rtag == 'delete':
+                    for idx in range(ri1, ri2):
+                        tr_el = etree.fromstring(etree.tostring(tbl_a.rows[idx]._tr))
+                        _wrap_all_runs_in_element_as_del(tr_el)
+                        _mark_row_paragraph_marks_deleted(tr_el)
+                        record_change('Tabellenänderung', rtexts_a[idx][:120], '', 0)
+                        tbl_el.append(tr_el)
+
+                elif rtag == 'insert':
+                    for idx in range(rj1, rj2):
+                        tr_el = etree.fromstring(etree.tostring(tbl_b.rows[idx]._tr))
+                        _wrap_all_runs_in_element_as_ins(tr_el)
+                        record_change('Tabellenänderung', '', rtexts_b[idx][:120], 0)
+                        tbl_el.append(tr_el)
+
+            body.append(tbl_el)
+
     out_path = os.path.join(tmpdir, 'redline.docx')
     out_doc.save(out_path)
     return out_path
@@ -1532,6 +1722,72 @@ def _generate_xlsx_redline(filepath_a, filepath_b, tmpdir):
     ws_summary.cell(stats_row, 1, 'Statistik:').font = FONTS['legend_label']
 
     from collections import Counter
+
+    # ── Table-level changes for report ──
+    tables_a = doc_a.tables
+    tables_b = doc_b.tables
+    num_tables_report = max(len(tables_a), len(tables_b))
+
+    for tbl_idx in range(num_tables_report):
+        tbl_a_rep = tables_a[tbl_idx] if tbl_idx < len(tables_a) else None
+        tbl_b_rep = tables_b[tbl_idx] if tbl_idx < len(tables_b) else None
+        tbl_label = f'Tabelle {tbl_idx + 1}'
+
+        if tbl_a_rep is None and tbl_b_rep is not None:
+            record_change('Tabellenänderung', '', f'{tbl_label}: Gesamte Tabelle eingefügt')
+        elif tbl_b_rep is None and tbl_a_rep is not None:
+            record_change('Tabellenänderung', f'{tbl_label}: Gesamte Tabelle gelöscht', '')
+        else:
+            # Compare row-by-row, cell-by-cell
+            num_rows_a_rep = len(tbl_a_rep.rows)
+            num_rows_b_rep = len(tbl_b_rep.rows)
+
+            def _row_texts_report(table, n_rows):
+                """Get concatenated cell text per row."""
+                result = []
+                for ri in range(n_rows):
+                    cells_text = []
+                    for ci in range(len(table.rows[ri].cells)):
+                        cells_text.append(table.rows[ri].cells[ci].text or '')
+                    result.append('\t'.join(cells_text))
+                return result
+
+            rtexts_a_rep = _row_texts_report(tbl_a_rep, num_rows_a_rep)
+            rtexts_b_rep = _row_texts_report(tbl_b_rep, num_rows_b_rep)
+
+            row_sm_rep = difflib.SequenceMatcher(None, rtexts_a_rep, rtexts_b_rep, autojunk=False)
+            for rtag, ri1, ri2, rj1, rj2 in row_sm_rep.get_opcodes():
+                if rtag == 'equal':
+                    for offset in range(rj2 - rj1):
+                        a_ri = ri1 + offset
+                        b_ri = rj1 + offset
+                        row_a_rep = tbl_a_rep.rows[a_ri]
+                        row_b_rep = tbl_b_rep.rows[b_ri]
+                        num_cells = min(len(row_a_rep.cells), len(row_b_rep.cells))
+                        for ci in range(num_cells):
+                            text_a = row_a_rep.cells[ci].text or ''
+                            text_b = row_b_rep.cells[ci].text or ''
+                            if text_a != text_b:
+                                cell_ref = f'{tbl_label}, Zeile {a_ri + 1}, Zelle {ci + 1}'
+                                record_change('Tabellenänderung',
+                                              f'{cell_ref}: {text_a[:100]}',
+                                              f'{cell_ref}: {text_b[:100]}')
+                elif rtag == 'replace':
+                    for idx in range(ri1, ri2):
+                        record_change('Tabellenänderung',
+                                      f'{tbl_label}, Zeile {idx + 1}: {rtexts_a_rep[idx][:100]}', '')
+                    for idx in range(rj1, rj2):
+                        record_change('Tabellenänderung',
+                                      '', f'{tbl_label}, Zeile {idx + 1}: {rtexts_b_rep[idx][:100]}')
+                elif rtag == 'delete':
+                    for idx in range(ri1, ri2):
+                        record_change('Tabellenänderung',
+                                      f'{tbl_label}, Zeile {idx + 1}: {rtexts_a_rep[idx][:100]}', '')
+                elif rtag == 'insert':
+                    for idx in range(rj1, rj2):
+                        record_change('Tabellenänderung',
+                                      '', f'{tbl_label}, Zeile {idx + 1}: {rtexts_b_rep[idx][:100]}')
+
     type_counts = Counter(c['type'] for c in all_changes)
     for i, (ctype, count) in enumerate(type_counts.most_common()):
         ws_summary.cell(stats_row + 1 + i, 1, ctype).font = FONTS['normal']
