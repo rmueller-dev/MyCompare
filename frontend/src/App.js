@@ -382,6 +382,167 @@ function InlineHighlight({ tokens, side, text }) {
   return parts.length > 0 ? <>{parts}</> : <>{text}</>;
 }
 
+// ─── QUICK COMPARE (2 files → instant diff) ───
+function QuickCompare({ onResult, onDocCreated }) {
+  const [fileOld, setFileOld] = useState(null);
+  const [fileNew, setFileNew] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [dragOver, setDragOver] = useState(false);
+
+  const ALLOWED = ['.docx', '.xlsx', '.pptx', '.pdf'];
+  const isAllowed = (name) => ALLOWED.some(ext => name.toLowerCase().endsWith(ext));
+
+  const handleFiles = (files) => {
+    const valid = Array.from(files).filter(f => isAllowed(f.name));
+    if (valid.length < 2) {
+      if (valid.length === 1 && !fileOld) {
+        setFileOld(valid[0]);
+        setError('');
+      } else if (valid.length === 1 && fileOld) {
+        setFileNew(valid[0]);
+        setError('');
+      } else {
+        setError('Bitte zwei Dateien gleichen Typs auswählen (DOCX, XLSX, PPTX oder PDF)');
+      }
+      return;
+    }
+    // Sort by lastModified — older first
+    valid.sort((a, b) => (a.lastModified || 0) - (b.lastModified || 0));
+    setFileOld(valid[0]);
+    setFileNew(valid[1]);
+    setError('');
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setDragOver(false);
+    handleFiles(e.dataTransfer.files);
+  };
+
+  const swap = () => {
+    const tmp = fileOld;
+    setFileOld(fileNew);
+    setFileNew(tmp);
+  };
+
+  const runCompare = async () => {
+    if (!fileOld || !fileNew) return;
+    setLoading(true);
+    setError('');
+    const formData = new FormData();
+    formData.append('file_old', fileOld);
+    formData.append('file_new', fileNew);
+    try {
+      const res = await fetch(`${API}/quick-compare`, { method: 'POST', body: formData });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Vergleich fehlgeschlagen');
+      onResult(data);
+      if (onDocCreated) onDocCreated();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Auto-run when both files are set
+  useEffect(() => {
+    if (fileOld && fileNew && !loading) {
+      runCompare();
+    }
+  // eslint-disable-next-line
+  }, [fileOld, fileNew]);
+
+  return (
+    <div className="flex flex-col items-center justify-center h-full">
+      <div
+        className={`w-full max-w-2xl border-3 border-dashed rounded-2xl p-12 text-center transition-all cursor-pointer
+          ${dragOver ? 'border-primary-400 bg-primary-50 scale-[1.02]' : 'border-gray-300 bg-white hover:border-primary-300 hover:bg-gray-50'}`}
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={handleDrop}
+        onClick={() => {
+          if (!loading) document.getElementById('quick-file-input')?.click();
+        }}
+      >
+        <input id="quick-file-input" type="file" className="hidden" multiple accept=".docx,.xlsx,.pptx,.pdf"
+          onChange={e => handleFiles(e.target.files)} />
+
+        {loading ? (
+          <div>
+            <div className="inline-block w-12 h-12 border-4 border-primary-200 border-t-primary-600 rounded-full animate-spin mb-4"></div>
+            <p className="text-lg font-medium text-gray-700">Vergleich läuft...</p>
+            <p className="text-sm text-gray-500 mt-1">Dateien werden analysiert und verifiziert</p>
+          </div>
+        ) : (
+          <div>
+            <svg className="w-16 h-16 mx-auto mb-4 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5"
+                d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+            </svg>
+            <p className="text-xl font-semibold text-gray-700 mb-2">
+              2 Dateien hierher ziehen
+            </p>
+            <p className="text-sm text-gray-500 mb-4">
+              oder klicken zum Auswählen
+            </p>
+            <p className="text-xs text-gray-400">
+              DOCX, XLSX, PPTX oder PDF — die ältere Datei wird automatisch erkannt
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* File status */}
+      {(fileOld || fileNew) && !loading && (
+        <div className="mt-6 w-full max-w-2xl">
+          <div className="flex items-center gap-4">
+            <div className={`flex-1 rounded-lg p-3 text-sm ${fileOld ? 'bg-blue-50 border border-blue-200' : 'bg-gray-50 border border-dashed border-gray-300'}`}>
+              <div className="text-xs text-gray-500 mb-1">Alte Version</div>
+              {fileOld ? (
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-gray-800 truncate">{fileOld.name}</span>
+                  <button onClick={(e) => { e.stopPropagation(); setFileOld(null); }}
+                    className="text-gray-400 hover:text-red-500 ml-2 text-xs">X</button>
+                </div>
+              ) : (
+                <span className="text-gray-400">Datei auswählen...</span>
+              )}
+            </div>
+
+            <button onClick={(e) => { e.stopPropagation(); swap(); }}
+              className="text-gray-400 hover:text-primary-600 p-2" title="Reihenfolge tauschen">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+              </svg>
+            </button>
+
+            <div className={`flex-1 rounded-lg p-3 text-sm ${fileNew ? 'bg-green-50 border border-green-200' : 'bg-gray-50 border border-dashed border-gray-300'}`}>
+              <div className="text-xs text-gray-500 mb-1">Neue Version</div>
+              {fileNew ? (
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-gray-800 truncate">{fileNew.name}</span>
+                  <button onClick={(e) => { e.stopPropagation(); setFileNew(null); }}
+                    className="text-gray-400 hover:text-red-500 ml-2 text-xs">X</button>
+                </div>
+              ) : (
+                <span className="text-gray-400">Datei auswählen...</span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div className="mt-4 w-full max-w-2xl text-sm text-red-600 bg-red-50 border border-red-200 p-3 rounded-lg">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── UPLOAD MODAL ───
 function UploadModal({ onClose, onUpload, documents }) {
   const [mode, setMode] = useState('new');
@@ -495,6 +656,7 @@ export default function App() {
   const [versionA, setVersionA] = useState(null);
   const [versionB, setVersionB] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [quickDiff, setQuickDiff] = useState(null);
 
   const loadDocuments = useCallback(async () => {
     try {
@@ -621,15 +783,22 @@ export default function App() {
 
         {/* MAIN AREA */}
         <main className="flex-1 overflow-y-auto p-6">
-          {!selectedDoc ? (
-            <div className="flex flex-col items-center justify-center h-full text-gray-400">
-              <svg className="w-16 h-16 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5"
-                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-              <p className="text-lg">Wählen Sie ein Dokument aus der Bibliothek</p>
-              <p className="text-sm mt-1">oder laden Sie eine neue Datei hoch</p>
+          {quickDiff && !selectedDoc ? (
+            <div>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-2xl font-bold text-gray-800">Schnellvergleich</h2>
+                <button onClick={() => setQuickDiff(null)}
+                  className="text-sm text-gray-500 hover:text-gray-700 hover:bg-gray-100 px-3 py-1.5 rounded">
+                  Neuer Vergleich
+                </button>
+              </div>
+              <DiffView diffResult={quickDiff} />
             </div>
+          ) : !selectedDoc ? (
+            <QuickCompare
+              onResult={(data) => { setQuickDiff(data); }}
+              onDocCreated={loadDocuments}
+            />
           ) : (
             <div>
               {/* Document header */}

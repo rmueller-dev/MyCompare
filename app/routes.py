@@ -186,6 +186,92 @@ def diff_versions(doc_id, version_a, version_b):
         session.close()
 
 
+@api.route('/quick-compare', methods=['POST'])
+def quick_compare():
+    """
+    Quick compare: Upload 2 files, auto-detect old/new by last-modified metadata,
+    run diff immediately and return results.
+    """
+    if 'file_old' not in request.files or 'file_new' not in request.files:
+        return jsonify({'error': 'Bitte zwei Dateien hochladen (file_old, file_new)'}), 400
+
+    file_old = request.files['file_old']
+    file_new = request.files['file_new']
+
+    if not file_old.filename or not file_new.filename:
+        return jsonify({'error': 'Keine Dateinamen'}), 400
+
+    type_old = get_file_type(file_old.filename)
+    type_new = get_file_type(file_new.filename)
+
+    if not type_old or not type_new:
+        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF'}), 400
+    if type_old != type_new:
+        return jsonify({'error': f'Dateitypen stimmen nicht überein: {type_old.upper()} vs. {type_new.upper()}'}), 400
+
+    file_type = type_old
+
+    # Check file sizes
+    for f in [file_old, file_new]:
+        f.seek(0, 2)
+        if f.tell() > MAX_FILE_SIZE:
+            return jsonify({'error': f'Datei zu groß. Maximum: {MAX_FILE_SIZE // (1024*1024)} MB'}), 400
+        f.seek(0)
+
+    session = SessionLocal()
+    try:
+        # Create document
+        base_name = file_old.filename.rsplit('.', 1)[0]
+        doc = Document(name=f"{base_name} (Schnellvergleich)", file_type=file_type)
+        session.add(doc)
+        session.flush()
+
+        doc_dir = os.path.join(STORAGE_DIR, str(doc.id))
+        os.makedirs(doc_dir, exist_ok=True)
+
+        # Save both files
+        versions = []
+        for idx, (f, ver_num) in enumerate([(file_old, 1), (file_new, 2)]):
+            safe_name = secure_filename(f.filename) or 'upload'
+            unique_name = f"{uuid.uuid4().hex}_{safe_name}"
+            filepath = os.path.join(doc_dir, unique_name)
+            if not os.path.realpath(filepath).startswith(os.path.realpath(STORAGE_DIR)):
+                return jsonify({'error': 'Ungültiger Dateipfad'}), 400
+            f.save(filepath)
+            label = 'Alte Version' if ver_num == 1 else 'Neue Version'
+            version = Version(
+                document_id=doc.id,
+                version_number=ver_num,
+                filename=safe_name,
+                filepath=filepath,
+                label=label,
+            )
+            session.add(version)
+            versions.append(version)
+
+        session.commit()
+        session.refresh(doc)
+
+        # Run diff immediately
+        struct_a, text_a = extract(versions[0].filepath, file_type)
+        struct_b, text_b = extract(versions[1].filepath, file_type)
+        result = compute_diff(struct_a, text_a, struct_b, text_b, file_type)
+
+        result['version_a'] = versions[0].to_dict()
+        result['version_b'] = versions[1].to_dict()
+        result['document'] = doc.to_dict()
+
+        return jsonify(result)
+
+    except Exception as e:
+        session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': 'Vergleich fehlgeschlagen. Bitte prüfen Sie die Dateien.'}), 500
+    finally:
+        session.close()
+
+
 @api.route('/download/<int:doc_id>/<int:ver_id>', methods=['GET'])
 def download_version(doc_id, ver_id):
     session = SessionLocal()
