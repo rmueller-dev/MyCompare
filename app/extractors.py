@@ -476,12 +476,25 @@ def extract_docx(filepath):
         if all_extra:
             enriched_text = text + ' ' + ' '.join(all_extra)
 
+        # Compute formatting_key for quick formatting-only change detection
+        fmt_key_parts = []
+        for f in formatting:
+            for k, v in sorted(f.items()):
+                if k != 'text' and v:
+                    fmt_key_parts.append(f'{k}={v}')
+        if alignment:
+            fmt_key_parts.append(f'align={alignment}')
+        if style_name:
+            fmt_key_parts.append(f'style={style_name}')
+        formatting_key = ';'.join(fmt_key_parts)
+
         entry = {
             'index': len(paragraphs),
             'text': text,
             'enriched_text': enriched_text,
             'html': full_html,
             'formatting': formatting,
+            'formatting_key': formatting_key,
             'alignment': alignment,
             'style': style_name,
             'context': context,

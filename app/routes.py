@@ -966,11 +966,12 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
     CLR_GREY = RGBColor(0x66, 0x66, 0x66)
     CLR_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
     CLR_FMT = RGBColor(0xE6, 0x51, 0x00)    # orange for formatting changes
+    CLR_TBL = RGBColor(0x00, 0x69, 0x5C)    # teal for table changes
 
     type_bg_colors = {
         'Einfügung': 'E8F5E9', 'Löschung': 'FFEBEE', 'Ersetzung': 'FFF8E1',
         'Verschoben (Quelle)': 'F3E5F5', 'Verschoben (Ziel)': 'F3E5F5',
-        'Formatierung': 'FFF3E0',
+        'Formatierung': 'FFF3E0', 'Tabellenänderung': 'E0F2F1',
     }
 
     def set_cell_bg(cell, hex_color):
@@ -1099,6 +1100,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
         ('Ersetzung', 'Gelöschter Text (rot) gefolgt von neuem Text (blau)', CLR_GREY, False, False),
         ('Verschoben', 'Text der an eine andere Stelle verschoben wurde', CLR_MOVE, False, False),
         ('Formatierung', 'Gleicher Text, aber Formatierung geändert (z.B. Fett, Schriftgröße)', CLR_FMT, False, False),
+        ('Tabellenänderung', 'Änderungen innerhalb von Tabellenzellen, Zeilen oder ganzen Tabellen', CLR_TBL, False, False),
     ]
     for label, desc, color, strike, underline in legend_items:
         p = report.add_paragraph()

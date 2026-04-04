@@ -145,6 +145,15 @@ def structural_diff_docx(struct_a: list, struct_b: list) -> List[Dict[str, Any]]
             for offset in range(i2 - i1):
                 a_item = struct_a[i1 + offset]
                 b_item = struct_b[j1 + offset]
+                # Quick-check: skip expensive comparison if formatting_key matches
+                fk_a = a_item.get('formatting_key', '')
+                fk_b = b_item.get('formatting_key', '')
+                if fk_a == fk_b and a_item.get('alignment') == b_item.get('alignment') and \
+                   a_item.get('style') == b_item.get('style') and \
+                   a_item.get('numbering') == b_item.get('numbering') and \
+                   a_item.get('fields', []) == b_item.get('fields', []) and \
+                   set(a_item.get('bookmarks', [])) == set(b_item.get('bookmarks', [])):
+                    continue
                 fmt_diffs = _compare_formatting(
                     a_item.get('formatting', []),
                     b_item.get('formatting', [])
@@ -635,6 +644,36 @@ def compute_diff(struct_a, text_a, struct_b, text_b, file_type, options=None):
     replace_count = sum(1 for c in structural_changes if c.get('type') == 'replace')
     formatting_count = sum(1 for c in structural_changes if c.get('type') == 'formatting')
 
+    # Collect detailed format_changes list for formatting-only changes
+    format_changes = []
+    for c in structural_changes:
+        if c.get('type') == 'formatting':
+            fc_entry = {
+                'location': c.get('location', ''),
+                'details': c.get('formatting_changes', []),
+            }
+            # Extract text snippet for context
+            items = c.get('old_items') or c.get('new_items') or []
+            if items:
+                fc_entry['text'] = (items[0].get('text', '') or '')[:80]
+            elif c.get('old_text'):
+                fc_entry['text'] = (c['old_text'] or '')[:80]
+            elif c.get('new_text'):
+                fc_entry['text'] = (c['new_text'] or '')[:80]
+            format_changes.append(fc_entry)
+
+        # Also collect formatting changes noted in replace inline diffs
+        if c.get('type') == 'replace':
+            for inline in c.get('inline_diffs', []):
+                fmt_details = inline.get('formatting_changes', [])
+                if fmt_details:
+                    fc_entry = {
+                        'location': c.get('location', ''),
+                        'details': fmt_details,
+                        'text': (inline.get('old_text', '') or '')[:80],
+                    }
+                    format_changes.append(fc_entry)
+
     return {
         'structural_changes': structural_changes,
         'plaintext_changes': pt_changes,
@@ -647,6 +686,7 @@ def compute_diff(struct_a, text_a, struct_b, text_b, file_type, options=None):
             'delete_count': delete_count,
             'replace_count': replace_count,
             'formatting_count': formatting_count,
+            'format_changes': format_changes,
             'total_lines_a': len(lines_a),
             'total_lines_b': len(lines_b),
         },
