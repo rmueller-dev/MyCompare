@@ -7,6 +7,7 @@ from .models import SessionLocal, Document, Version, RenderingSet, STORAGE_DIR
 from .extractors import extract
 from .diff_engine import compute_diff
 from .image_diff import extract_images, compare_images
+from .ai_analysis import analyze_changes, _check_ollama
 
 api = Blueprint('api', __name__, url_prefix='/api')
 
