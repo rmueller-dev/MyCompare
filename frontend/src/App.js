@@ -632,7 +632,7 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
     const ext = getExt(filename);
     const baseName = filename.replace(/\.[^.]+$/, '').toLowerCase();
 
-    // 1. Exact name match on doc name or version filename
+    // 1. Exact name match on doc name or version filename (same type)
     const sameType = documents.filter(d => d.file_type === ext && (d.versions || []).length > 0);
     for (const doc of sameType) {
       const docBase = doc.name.toLowerCase();
@@ -642,7 +642,7 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
         if (vBase === baseName) return doc;
       }
     }
-    // 2. Partial name match
+    // 2. Partial name match (same type)
     for (const doc of sameType) {
       const docBase = doc.name.toLowerCase();
       if (docBase.includes(baseName) || baseName.includes(docBase)) return doc;
@@ -653,6 +653,13 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
     }
     // 3. If only one document of this type exists, use it
     if (sameType.length === 1) return sameType[0];
+
+    // 4. Try all types for name match (enables cross-format auto-detect)
+    const allWithVersions = documents.filter(d => (d.versions || []).length > 0);
+    for (const doc of allWithVersions) {
+      const docBase = doc.name.toLowerCase();
+      if (docBase === baseName) return doc;
+    }
 
     return null;
   };
@@ -1018,9 +1025,29 @@ export default function App() {
     setVersionB(null);
   };
 
-  const handleUpload = (doc) => {
-    loadDocuments();
+  const handleUpload = async (doc) => {
+    await loadDocuments();
     setSelectedDoc(doc);
+    // Auto-compare: if document has 2+ versions, auto-diff last two
+    const versions = doc?.versions || [];
+    if (versions.length >= 2) {
+      const verOld = versions[versions.length - 2];
+      const verNew = versions[versions.length - 1];
+      setVersionA(verOld.version_number);
+      setVersionB(verNew.version_number);
+      // Auto-run diff
+      setDiffLoading(true);
+      setDiffResult(null);
+      try {
+        const res = await fetch(`${API}/diff/${doc.id}/${verOld.version_number}/${verNew.version_number}`);
+        const data = await res.json();
+        if (res.ok) setDiffResult(data);
+      } catch (err) {
+        console.error('Auto-diff failed:', err);
+      } finally {
+        setDiffLoading(false);
+      }
+    }
   };
 
   const runDiff = async () => {
