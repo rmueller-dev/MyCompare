@@ -847,12 +847,11 @@ def _generate_pdf_redline(filepath_a, filepath_b, tmpdir):
 @api.route('/export-changes/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
 def export_changed_pages(doc_id, version_a, version_b):
     """
-    Export only the changed pages/sections as original format or PDF.
+    Export changes. format=original copies version B, format=pdf generates a redline PDF.
     Query param: format=original|pdf
     """
     import tempfile
     import shutil
-    import subprocess
 
     output_format = request.args.get('format', 'original')
     if output_format not in ('original', 'pdf'):
@@ -869,73 +868,41 @@ def export_changed_pages(doc_id, version_a, version_b):
         if not ver_a or not ver_b:
             return jsonify({'error': 'Version nicht gefunden'}), 404
 
-        struct_a, text_a = extract(ver_a.filepath, doc.file_type)
-        struct_b, text_b = extract(ver_b.filepath, doc.file_type)
-        diff_result = compute_diff(struct_a, text_a, struct_b, text_b, doc.file_type)
+        # For PDF format: generate a redline PDF directly
+        if output_format == 'pdf':
+            tmpdir = tempfile.mkdtemp()
+            try:
+                out_path = _generate_redline_pdf(ver_a.filepath, ver_b.filepath, doc.file_type, tmpdir)
+                dl_name = f"{doc.name}_Redline_V{version_a}_vs_V{version_b}.pdf"
+                return send_from_directory(
+                    os.path.dirname(out_path),
+                    os.path.basename(out_path),
+                    as_attachment=True,
+                    download_name=dl_name,
+                )
+            finally:
+                import threading
+                def cleanup():
+                    import time
+                    time.sleep(10)
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                threading.Thread(target=cleanup, daemon=True).start()
 
-        # Determine which pages/sections changed
-        changed_pages = set()
-        for change in diff_result['structural_changes']:
-            loc = change.get('location', '')
-            # Extract page/slide/section numbers
-            import re
-            nums = re.findall(r'\d+', loc)
-            if nums:
-                changed_pages.add(int(nums[0]))
-            # For items with page info
-            for items_key in ('old_items', 'new_items'):
-                for item in change.get(items_key, []):
-                    if 'page' in item:
-                        changed_pages.add(item['page'])
-                    elif 'slide' in item:
-                        changed_pages.add(item['slide'])
-
-        # For plaintext changes, map line numbers to pages
-        lines_per_page_a = {}
-        line_num = 0
-        for item in struct_a:
-            page = item.get('page') or item.get('slide') or item.get('index', 0) + 1
-            text = item.get('text', '')
-            for _ in text.split('\n'):
-                lines_per_page_a[line_num] = page
-                line_num += 1
-
-        for change in diff_result['plaintext_changes']:
-            for line_idx in range(change.get('old_start', 0), change.get('old_end', 0)):
-                if line_idx in lines_per_page_a:
-                    changed_pages.add(lines_per_page_a[line_idx])
-
-        if not changed_pages:
-            return jsonify({'error': 'Keine geänderten Seiten gefunden'}), 404
-
-        changed_pages = sorted(changed_pages)
-
-        # Generate export based on file type
+        # For original format: export version B as-is
         tmpdir = tempfile.mkdtemp()
         try:
-            if doc.file_type == 'pdf':
-                export_path = _export_pdf_pages(ver_b.filepath, changed_pages, tmpdir, output_format)
-            elif doc.file_type == 'docx':
-                export_path = _export_docx_pages(ver_b.filepath, changed_pages, tmpdir, output_format)
-            elif doc.file_type == 'xlsx':
-                export_path = _export_xlsx_sheets(ver_b.filepath, changed_pages, tmpdir, output_format, struct_b)
-            elif doc.file_type == 'pptx':
-                export_path = _export_pptx_slides(ver_b.filepath, changed_pages, tmpdir, output_format)
-            else:
-                return jsonify({'error': 'Export nicht unterstützt'}), 400
-
-            if not export_path or not os.path.exists(export_path):
-                return jsonify({'error': 'Export fehlgeschlagen'}), 500
-
-            dl_name = f"{doc.name}_Aenderungen_V{version_a}_vs_V{version_b}{os.path.splitext(export_path)[1]}"
+            ext = {'docx': '.docx', 'xlsx': '.xlsx', 'pptx': '.pptx', 'pdf': '.pdf',
+                   'rtf': '.rtf', 'txt': '.txt'}.get(doc.file_type, '.bin')
+            out_path = os.path.join(tmpdir, f'export{ext}')
+            shutil.copy2(ver_b.filepath, out_path)
+            dl_name = f"{doc.name}_V{version_b}{ext}"
             return send_from_directory(
-                os.path.dirname(export_path),
-                os.path.basename(export_path),
+                os.path.dirname(out_path),
+                os.path.basename(out_path),
                 as_attachment=True,
                 download_name=dl_name,
             )
         finally:
-            # Clean up after a delay (let the response finish)
             import threading
             def cleanup():
                 import time
@@ -949,6 +916,112 @@ def export_changed_pages(doc_id, version_a, version_b):
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
+
+
+def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir):
+    """
+    Generate a PDF redline showing all changes:
+    - Deleted text in red with strikethrough
+    - Inserted text in blue with underline
+    - Unchanged text in black
+    Works for all file types.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.colors import HexColor
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from html import escape
+    import difflib
+    import re
+
+    # Extract text from both versions
+    struct_a, text_a = extract(filepath_a, file_type)
+    struct_b, text_b = extract(filepath_b, file_type)
+
+    out_path = os.path.join(tmpdir, 'redline.pdf')
+    doc = SimpleDocTemplate(out_path, pagesize=A4,
+                            leftMargin=20*mm, rightMargin=20*mm,
+                            topMargin=15*mm, bottomMargin=15*mm)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('RTitle', parent=styles['Title'], fontSize=14,
+                                  spaceAfter=6*mm)
+    body_style = ParagraphStyle('RBody', parent=styles['Normal'],
+                                 fontSize=10, leading=14,
+                                 fontName='Helvetica')
+    legend_style = ParagraphStyle('RLegend', parent=styles['Normal'],
+                                   fontSize=8, leading=10, textColor=colors.grey)
+
+    story = []
+    story.append(Paragraph("Änderungsbericht (Redline)", title_style))
+
+    # Legend
+    legend_html = (
+        '<font color="red"><strike>Rot durchgestrichen</strike></font> = gelöscht &nbsp;&nbsp; '
+        '<font color="blue"><u>Blau unterstrichen</u></font> = eingefügt &nbsp;&nbsp; '
+        'Schwarz = unverändert'
+    )
+    story.append(Paragraph(legend_html, legend_style))
+    story.append(Spacer(1, 4*mm))
+
+    # Get lines
+    lines_a = text_a.splitlines()
+    lines_b = text_b.splitlines()
+
+    sm = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            for idx in range(i1, i2):
+                safe = escape(lines_a[idx]) or '&nbsp;'
+                story.append(Paragraph(safe, body_style))
+
+        elif tag == 'replace':
+            for idx in range(max(i2 - i1, j2 - j1)):
+                old_line = lines_a[i1 + idx] if (i1 + idx) < i2 else ''
+                new_line = lines_b[j1 + idx] if (j1 + idx) < j2 else ''
+
+                if old_line and new_line:
+                    # Word-level diff
+                    words_a = re.findall(r'\S+|\s+', old_line)
+                    words_b = re.findall(r'\S+|\s+', new_line)
+                    wsm = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
+                    parts = []
+                    for wtag, wi1, wi2, wj1, wj2 in wsm.get_opcodes():
+                        if wtag == 'equal':
+                            parts.append(escape(''.join(words_b[wj1:wj2])))
+                        elif wtag == 'replace':
+                            parts.append(f'<font color="red"><strike>{escape("".join(words_a[wi1:wi2]))}</strike></font>')
+                            parts.append(f'<font color="blue"><u>{escape("".join(words_b[wj1:wj2]))}</u></font>')
+                        elif wtag == 'delete':
+                            parts.append(f'<font color="red"><strike>{escape("".join(words_a[wi1:wi2]))}</strike></font>')
+                        elif wtag == 'insert':
+                            parts.append(f'<font color="blue"><u>{escape("".join(words_b[wj1:wj2]))}</u></font>')
+                    story.append(Paragraph(''.join(parts) or '&nbsp;', body_style))
+                elif old_line:
+                    safe = escape(old_line)
+                    story.append(Paragraph(f'<font color="red"><strike>{safe}</strike></font>', body_style))
+                elif new_line:
+                    safe = escape(new_line)
+                    story.append(Paragraph(f'<font color="blue"><u>{safe}</u></font>', body_style))
+
+        elif tag == 'delete':
+            for idx in range(i1, i2):
+                safe = escape(lines_a[idx])
+                story.append(Paragraph(f'<font color="red"><strike>{safe}</strike></font>', body_style))
+
+        elif tag == 'insert':
+            for idx in range(j1, j2):
+                safe = escape(lines_b[idx])
+                story.append(Paragraph(f'<font color="blue"><u>{safe}</u></font>', body_style))
+
+    if not story or len(story) <= 3:
+        story.append(Paragraph("Keine Änderungen erkannt.", body_style))
+
+    doc.build(story)
+    return out_path
 
 
 def _export_pdf_pages(filepath, pages, tmpdir, output_format):
