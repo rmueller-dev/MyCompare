@@ -70,6 +70,6 @@ echo ""
 gunicorn \
     --bind "127.0.0.1:$PORT" \
     --workers 2 \
-    --timeout 600 \
+    --timeout 1800 \
     --access-logfile - \
     "app.main:create_app()"
