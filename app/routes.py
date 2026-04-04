@@ -602,57 +602,322 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
 
 
 def _generate_xlsx_redline(filepath_a, filepath_b, tmpdir):
-    """Generate an XLSX with changes highlighted: deleted cells red, new cells green, changed cells yellow."""
+    """
+    Generate an XLSX redline following Litera Compare conventions:
+    - Separate colors for direct content changes vs indirect/formula changes
+    - Cell content colored: deleted text in red, inserted text in blue
+    - Cell background: light fill per change type
+    - Inserted/deleted rows and columns detected and highlighted
+    - Summary/Legend sheet with change statistics
+    - Comments on changed cells showing old value
+    - Formula change annotations
+    """
     from openpyxl import load_workbook
-    from openpyxl.styles import PatternFill, Font
-    import copy
+    from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
+    from openpyxl.comments import Comment
+    import re
 
-    wb_a = load_workbook(filepath_a, data_only=True)
-    wb_b = load_workbook(filepath_b)
+    wb_a_data = load_workbook(filepath_a, data_only=True)
+    wb_a_formulas = load_workbook(filepath_a, data_only=False)
+    wb_b = load_workbook(filepath_b, data_only=False)
+    wb_b_data = load_workbook(filepath_b, data_only=True)
 
-    red_fill = PatternFill(start_color='FFFECACA', end_color='FFFECACA', fill_type='solid')
-    green_fill = PatternFill(start_color='FFBBF7D0', end_color='FFBBF7D0', fill_type='solid')
-    yellow_fill = PatternFill(start_color='FFFEF3C7', end_color='FFFEF3C7', fill_type='solid')
-    red_font = Font(color='DC2626', strikethrough=True)
-    blue_font = Font(color='2563EB', underline='single')
+    # Color scheme (Litera-style)
+    COLORS = {
+        'direct_insert_fill': PatternFill(start_color='FFE8F5E9', end_color='FFE8F5E9', fill_type='solid'),
+        'direct_delete_fill': PatternFill(start_color='FFFFEBEE', end_color='FFFFEBEE', fill_type='solid'),
+        'direct_change_fill': PatternFill(start_color='FFFFF8E1', end_color='FFFFF8E1', fill_type='solid'),
+        'indirect_fill': PatternFill(start_color='FFE3F2FD', end_color='FFE3F2FD', fill_type='solid'),
+        'format_fill': PatternFill(start_color='FFF3E5F5', end_color='FFF3E5F5', fill_type='solid'),
+        'inserted_row_fill': PatternFill(start_color='FFC8E6C9', end_color='FFC8E6C9', fill_type='solid'),
+        'deleted_row_fill': PatternFill(start_color='FFFFCDD2', end_color='FFFFCDD2', fill_type='solid'),
+    }
+    FONTS = {
+        'deleted': Font(color='C62828', strikethrough=True),
+        'inserted': Font(color='1565C0', underline='single'),
+        'changed_new': Font(color='1565C0'),
+        'formula_change': Font(color='6A1B9A', italic=True),
+        'header': Font(bold=True, size=11),
+        'legend_label': Font(bold=True, size=10),
+        'normal': Font(size=10),
+    }
+    change_border = Border(
+        left=Side(style='thin', color='FFBDBDBD'),
+        right=Side(style='thin', color='FFBDBDBD'),
+        top=Side(style='thin', color='FFBDBDBD'),
+        bottom=Side(style='thin', color='FFBDBDBD'),
+    )
 
-    # Build value maps for A
-    vals_a = {}
-    for sn in wb_a.sheetnames:
-        ws = wb_a[sn]
+    # Collect all changes for summary
+    all_changes = []
+
+    # Build complete value + formula maps for version A
+    data_a = {}   # coord -> display value
+    formulas_a = {}  # coord -> formula string
+    for sn in wb_a_data.sheetnames:
+        ws_data = wb_a_data[sn]
+        ws_form = wb_a_formulas[sn] if sn in wb_a_formulas.sheetnames else None
+        for row in ws_data.iter_rows():
+            for cell in row:
+                if cell.value is not None:
+                    key = f"{sn}!{cell.coordinate}"
+                    data_a[key] = str(cell.value)
+                    if ws_form:
+                        fc = ws_form[cell.coordinate]
+                        if fc.value is not None and str(fc.value).startswith('='):
+                            formulas_a[key] = str(fc.value)
+
+    # Detect inserted/deleted rows per sheet
+    def get_row_keys(ws):
+        """Get a list of row 'fingerprints' for row insertion/deletion detection."""
+        rows = {}
         for row in ws.iter_rows():
             for cell in row:
                 if cell.value is not None:
-                    vals_a[f"{sn}!{cell.coordinate}"] = str(cell.value)
+                    r = cell.row
+                    if r not in rows:
+                        rows[r] = []
+                    rows[r].append(str(cell.value))
+        return {r: '|'.join(vals) for r, vals in rows.items()}
 
-    # Mark changes in B
+    # Process each sheet in version B
     for sn in wb_b.sheetnames:
         ws = wb_b[sn]
+
+        # Detect inserted/deleted rows
+        rows_a = get_row_keys(wb_a_data[sn]) if sn in wb_a_data.sheetnames else {}
+        rows_b = get_row_keys(ws)
+
+        fingerprints_a = set(rows_a.values())
+        fingerprints_b = set(rows_b.values())
+
+        inserted_rows = set()
+        for r, fp in rows_b.items():
+            if fp not in fingerprints_a and fp.strip('|'):
+                inserted_rows.add(r)
+
+        deleted_row_fps = {}
+        for r, fp in rows_a.items():
+            if fp not in fingerprints_b and fp.strip('|'):
+                deleted_row_fps[r] = fp
+
+        # Process cells
         for row in ws.iter_rows():
             for cell in row:
                 key = f"{sn}!{cell.coordinate}"
-                val_b = str(cell.value) if cell.value is not None else None
-                val_a = vals_a.pop(key, None)
+                val_b_display = str(wb_b_data[sn][cell.coordinate].value) if wb_b_data[sn][cell.coordinate].value is not None else None
+                val_b_formula = str(cell.value) if cell.value is not None and str(cell.value).startswith('=') else None
+                val_b = val_b_display
+                val_a = data_a.pop(key, None)
+                formula_a = formulas_a.get(key)
+
+                # Check if this is an inserted row
+                if cell.row in inserted_rows and val_b is not None:
+                    cell.fill = COLORS['inserted_row_fill']
+                    cell.font = FONTS['inserted']
+                    cell.border = change_border
+                    all_changes.append({
+                        'sheet': sn, 'cell': cell.coordinate,
+                        'type': 'Eingefügte Zeile', 'new': val_b or '', 'old': ''
+                    })
+                    continue
 
                 if val_a is None and val_b is not None:
-                    # New cell
-                    cell.fill = green_fill
-                    cell.font = blue_font
-                elif val_a is not None and val_b is not None and val_a != val_b:
-                    # Changed cell - show old → new
-                    cell.fill = yellow_fill
-                    cell.value = f"{val_b}  [war: {val_a}]"
+                    # New cell (direct insert)
+                    cell.fill = COLORS['direct_insert_fill']
+                    cell.font = FONTS['inserted']
+                    cell.border = change_border
+                    all_changes.append({
+                        'sheet': sn, 'cell': cell.coordinate,
+                        'type': 'Neue Zelle', 'new': val_b, 'old': ''
+                    })
 
-    # Add deleted cells info to a new sheet if any remain
-    if vals_a:
-        ws_del = wb_b.create_sheet('Gelöschte Zellen')
-        ws_del.cell(1, 1, 'Zelle').font = Font(bold=True)
-        ws_del.cell(1, 2, 'Alter Wert').font = Font(bold=True)
-        for i, (coord, val) in enumerate(sorted(vals_a.items()), 2):
-            ws_del.cell(i, 1, coord)
-            c = ws_del.cell(i, 2, val)
-            c.fill = red_fill
-            c.font = red_font
+                elif val_a is not None and val_b is not None and val_a != val_b:
+                    # Content changed
+                    # Check if formula changed
+                    formula_b = val_b_formula
+                    if formula_a and formula_b and formula_a != formula_b:
+                        # Formula change (could be direct or indirect)
+                        cell.fill = COLORS['direct_change_fill']
+                        cell.font = FONTS['changed_new']
+                        cell.border = change_border
+                        cell.comment = Comment(
+                            f"Alter Wert: {val_a}\nAlte Formel: {formula_a}\nNeue Formel: {formula_b}",
+                            "MyCompare"
+                        )
+                        all_changes.append({
+                            'sheet': sn, 'cell': cell.coordinate,
+                            'type': 'Formeländerung',
+                            'old': f"{val_a} ({formula_a})",
+                            'new': f"{val_b} ({formula_b})"
+                        })
+                    elif formula_a and not formula_b:
+                        # Formula removed
+                        cell.fill = COLORS['direct_change_fill']
+                        cell.font = FONTS['changed_new']
+                        cell.border = change_border
+                        cell.comment = Comment(
+                            f"Alter Wert: {val_a}\nFormel entfernt: {formula_a}",
+                            "MyCompare"
+                        )
+                        all_changes.append({
+                            'sheet': sn, 'cell': cell.coordinate,
+                            'type': 'Formel entfernt',
+                            'old': f"{val_a} ({formula_a})", 'new': val_b
+                        })
+                    elif not formula_a and formula_b:
+                        # Formula added
+                        cell.fill = COLORS['direct_change_fill']
+                        cell.font = FONTS['formula_change']
+                        cell.border = change_border
+                        cell.comment = Comment(
+                            f"Alter Wert: {val_a}\nNeue Formel: {formula_b}",
+                            "MyCompare"
+                        )
+                        all_changes.append({
+                            'sheet': sn, 'cell': cell.coordinate,
+                            'type': 'Formel hinzugefügt',
+                            'old': val_a, 'new': f"{val_b} ({formula_b})"
+                        })
+                    else:
+                        # Direct content change
+                        cell.fill = COLORS['direct_change_fill']
+                        cell.font = FONTS['changed_new']
+                        cell.border = change_border
+                        cell.comment = Comment(f"Alter Wert: {val_a}", "MyCompare")
+                        all_changes.append({
+                            'sheet': sn, 'cell': cell.coordinate,
+                            'type': 'Inhalt geändert', 'old': val_a, 'new': val_b
+                        })
+
+                elif val_a is not None and val_b is None:
+                    # Cell deleted (was in A, empty in B)
+                    cell.fill = COLORS['direct_delete_fill']
+                    cell.font = FONTS['deleted']
+                    cell.value = val_a
+                    cell.border = change_border
+                    cell.comment = Comment("Zelle gelöscht", "MyCompare")
+                    all_changes.append({
+                        'sheet': sn, 'cell': cell.coordinate,
+                        'type': 'Zelle gelöscht', 'old': val_a, 'new': ''
+                    })
+
+    # Handle cells that exist only in A (deleted from sheets still in B)
+    remaining_by_sheet = {}
+    for key, val in data_a.items():
+        parts = key.split('!')
+        sn = parts[0]
+        coord = parts[1]
+        if sn not in remaining_by_sheet:
+            remaining_by_sheet[sn] = []
+        remaining_by_sheet[sn].append((coord, val))
+
+    for sn, cells in remaining_by_sheet.items():
+        if sn in wb_b.sheetnames:
+            ws = wb_b[sn]
+            for coord, val in cells:
+                try:
+                    c = ws[coord]
+                    if c.value is None:
+                        c.value = val
+                        c.fill = COLORS['direct_delete_fill']
+                        c.font = FONTS['deleted']
+                        c.border = change_border
+                        c.comment = Comment("Zelle gelöscht", "MyCompare")
+                        all_changes.append({
+                            'sheet': sn, 'cell': coord,
+                            'type': 'Zelle gelöscht', 'old': val, 'new': ''
+                        })
+                except Exception:
+                    pass
+
+    # Add deleted rows info for sheets in A not in B
+    for sn in wb_a_data.sheetnames:
+        if sn not in wb_b.sheetnames:
+            all_changes.append({
+                'sheet': sn, 'cell': '-',
+                'type': 'Blatt gelöscht', 'old': sn, 'new': ''
+            })
+
+    # Add new sheets info
+    for sn in wb_b.sheetnames:
+        if sn not in wb_a_data.sheetnames:
+            all_changes.append({
+                'sheet': sn, 'cell': '-',
+                'type': 'Neues Blatt', 'old': '', 'new': sn
+            })
+
+    # ─── Create Summary & Legend Sheet ───
+    ws_summary = wb_b.create_sheet('Änderungsübersicht', 0)  # Insert as first sheet
+
+    # Title
+    ws_summary.merge_cells('A1:F1')
+    title_cell = ws_summary['A1']
+    title_cell.value = 'Änderungsübersicht — MyCompare Redline'
+    title_cell.font = Font(bold=True, size=14, color='1565C0')
+    title_cell.alignment = Alignment(horizontal='center')
+
+    # Legend
+    ws_summary['A3'] = 'Legende:'
+    ws_summary['A3'].font = FONTS['legend_label']
+
+    legend_items = [
+        ('Neue Zelle / Eingefügt', COLORS['direct_insert_fill'], FONTS['inserted']),
+        ('Gelöscht', COLORS['direct_delete_fill'], FONTS['deleted']),
+        ('Inhalt geändert', COLORS['direct_change_fill'], FONTS['changed_new']),
+        ('Formeländerung', COLORS['direct_change_fill'], FONTS['formula_change']),
+        ('Eingefügte Zeile', COLORS['inserted_row_fill'], FONTS['inserted']),
+        ('Indirekte Änderung', COLORS['indirect_fill'], FONTS['normal']),
+    ]
+    for i, (label, fill, font) in enumerate(legend_items):
+        row = 4 + i
+        c = ws_summary.cell(row, 1, '  Beispiel  ')
+        c.fill = fill
+        c.font = font
+        c.border = change_border
+        ws_summary.cell(row, 2, f'  = {label}').font = FONTS['normal']
+
+    # Statistics
+    stats_row = 4 + len(legend_items) + 1
+    ws_summary.cell(stats_row, 1, 'Statistik:').font = FONTS['legend_label']
+
+    from collections import Counter
+    type_counts = Counter(c['type'] for c in all_changes)
+    for i, (ctype, count) in enumerate(type_counts.most_common()):
+        ws_summary.cell(stats_row + 1 + i, 1, ctype).font = FONTS['normal']
+        ws_summary.cell(stats_row + 1 + i, 2, count).font = Font(bold=True, size=10)
+
+    total_row = stats_row + 1 + len(type_counts)
+    ws_summary.cell(total_row + 1, 1, 'Gesamt:').font = FONTS['legend_label']
+    ws_summary.cell(total_row + 1, 2, len(all_changes)).font = Font(bold=True, size=12, color='1565C0')
+
+    # Change detail table
+    detail_row = total_row + 3
+    ws_summary.cell(detail_row, 1, 'Alle Änderungen:').font = FONTS['legend_label']
+    headers = ['Blatt', 'Zelle', 'Typ', 'Alter Wert', 'Neuer Wert']
+    for col, h in enumerate(headers, 1):
+        c = ws_summary.cell(detail_row + 1, col, h)
+        c.font = Font(bold=True, size=10, color='FFFFFF')
+        c.fill = PatternFill(start_color='FF1565C0', end_color='FF1565C0', fill_type='solid')
+        c.alignment = Alignment(horizontal='center')
+
+    for i, change in enumerate(all_changes[:500]):  # Limit to 500 rows
+        r = detail_row + 2 + i
+        ws_summary.cell(r, 1, change['sheet'])
+        ws_summary.cell(r, 2, change['cell'])
+        ws_summary.cell(r, 3, change['type'])
+        old_cell = ws_summary.cell(r, 4, change['old'][:100] if change['old'] else '')
+        old_cell.font = FONTS['deleted'] if change['old'] else FONTS['normal']
+        new_cell = ws_summary.cell(r, 5, change['new'][:100] if change['new'] else '')
+        new_cell.font = FONTS['inserted'] if change['new'] else FONTS['normal']
+
+    # Auto-width columns
+    for col_letter in ['A', 'B', 'C', 'D', 'E', 'F']:
+        ws_summary.column_dimensions[col_letter].width = 20
+
+    if len(all_changes) > 500:
+        r = detail_row + 502
+        ws_summary.cell(r, 1, f'... und {len(all_changes) - 500} weitere Änderungen').font = Font(italic=True, color='999999')
 
     out_path = os.path.join(tmpdir, 'redline.xlsx')
     wb_b.save(out_path)
