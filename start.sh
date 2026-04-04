@@ -23,29 +23,45 @@ source venv/bin/activate
 echo "[2/4] Installiere Python-Abhängigkeiten..."
 pip install -q -r requirements.txt
 
-# 3. Build React frontend
-echo "[3/4] Baue React-Frontend..."
-cd frontend
-if [ ! -d "node_modules" ]; then
-    npm install --silent 2>/dev/null || npm install
+# 3. Build React frontend (only if build dir missing)
+if [ ! -d "frontend/build" ]; then
+    echo "[3/4] Baue React-Frontend..."
+    cd frontend
+    if [ ! -d "node_modules" ]; then
+        npm install --silent 2>/dev/null || npm install
+    fi
+    npm run build 2>&1 | tail -1
+    cd "$SCRIPT_DIR"
+else
+    echo "[3/4] Frontend bereits gebaut."
 fi
-npm run build 2>&1 | tail -1
-cd "$SCRIPT_DIR"
 
-# 4. Start Flask server
-echo "[4/4] Starte Server auf http://localhost:5000 ..."
+# 4. Find free port (AirPlay on macOS uses 5000)
+PORT=5000
+if command -v lsof &>/dev/null; then
+    if lsof -i :5000 &>/dev/null 2>&1; then
+        PORT=5050
+        echo "  Hinweis: Port 5000 belegt (vermutlich AirPlay). Verwende Port $PORT."
+    fi
+fi
+
+echo "[4/4] Starte Server auf http://localhost:$PORT ..."
 echo ""
 
 # Open browser (works on Linux, macOS, WSL)
 (sleep 2 && {
-    if command -v xdg-open &>/dev/null; then
-        xdg-open http://localhost:5000
-    elif command -v open &>/dev/null; then
-        open http://localhost:5000
+    if command -v open &>/dev/null; then
+        open "http://localhost:$PORT"
+    elif command -v xdg-open &>/dev/null; then
+        xdg-open "http://localhost:$PORT"
     elif command -v wslview &>/dev/null; then
-        wslview http://localhost:5000
+        wslview "http://localhost:$PORT"
     fi
 }) &
 
-# Run Flask
-python -m app.main
+# Run Flask on detected port
+python -c "
+from app.main import create_app
+app = create_app()
+app.run(debug=False, port=$PORT, host='127.0.0.1')
+"
