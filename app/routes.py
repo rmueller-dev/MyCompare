@@ -286,6 +286,177 @@ def download_version(doc_id, ver_id):
         session.close()
 
 
+@api.route('/redline/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
+def generate_redline(doc_id, version_a, version_b):
+    """Generate a Word document with tracked changes (Änderungsmodus/Redline)."""
+    import tempfile
+    import shutil
+
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        if not doc:
+            return jsonify({'error': 'Dokument nicht gefunden'}), 404
+
+        ver_a = session.query(Version).filter_by(document_id=doc_id, version_number=version_a).first()
+        ver_b = session.query(Version).filter_by(document_id=doc_id, version_number=version_b).first()
+        if not ver_a or not ver_b:
+            return jsonify({'error': 'Version nicht gefunden'}), 404
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            if doc.file_type == 'docx':
+                out_path = _generate_docx_redline(ver_a.filepath, ver_b.filepath, tmpdir)
+            else:
+                return jsonify({'error': 'Änderungsmodus nur für DOCX verfügbar'}), 400
+
+            dl_name = f"{doc.name}_Redline_V{version_a}_vs_V{version_b}.docx"
+            return send_from_directory(
+                os.path.dirname(out_path),
+                os.path.basename(out_path),
+                as_attachment=True,
+                download_name=dl_name,
+            )
+        finally:
+            import threading
+            def cleanup():
+                import time
+                time.sleep(10)
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            threading.Thread(target=cleanup, daemon=True).start()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': 'Redline-Erstellung fehlgeschlagen.'}), 500
+    finally:
+        session.close()
+
+
+def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
+    """
+    Generate a DOCX with visual tracked changes.
+    Deletions shown in red strikethrough, insertions in blue underlined.
+    """
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_COLOR_INDEX
+    import difflib
+
+    doc_a = DocxDocument(filepath_a)
+    doc_b = DocxDocument(filepath_b)
+
+    # Extract paragraph texts
+    paras_a = [p.text for p in doc_a.paragraphs]
+    paras_b = [p.text for p in doc_b.paragraphs]
+
+    # Create output document based on version B structure
+    out_doc = DocxDocument()
+
+    # Copy styles from version B if possible
+    sm = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            for idx in range(j1, j2):
+                # Copy paragraph from B as-is
+                src_para = doc_b.paragraphs[idx]
+                p = out_doc.add_paragraph()
+                if src_para.style:
+                    try:
+                        p.style = out_doc.styles[src_para.style.name]
+                    except KeyError:
+                        pass
+                p.alignment = src_para.alignment
+                for run in src_para.runs:
+                    new_run = p.add_run(run.text)
+                    new_run.bold = run.bold
+                    new_run.italic = run.italic
+                    new_run.underline = run.underline
+                    if run.font.size:
+                        new_run.font.size = run.font.size
+                    if run.font.name:
+                        new_run.font.name = run.font.name
+                    if run.font.color and run.font.color.rgb:
+                        new_run.font.color.rgb = run.font.color.rgb
+
+        elif tag == 'replace':
+            # Show deleted text then inserted text with word-level detail
+            for idx in range(i1, i2):
+                old_text = paras_a[idx]
+                # Find best matching new paragraph
+                new_idx = j1 + (idx - i1) if (j1 + (idx - i1)) < j2 else None
+                new_text = paras_b[new_idx] if new_idx is not None else ''
+
+                p = out_doc.add_paragraph()
+
+                if old_text and new_text:
+                    # Word-level diff within the paragraph
+                    import re
+                    words_a = re.findall(r'\S+|\s+', old_text)
+                    words_b = re.findall(r'\S+|\s+', new_text)
+                    wsm = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
+
+                    for wtag, wi1, wi2, wj1, wj2 in wsm.get_opcodes():
+                        if wtag == 'equal':
+                            run = p.add_run(''.join(words_b[wj1:wj2]))
+                        elif wtag == 'replace':
+                            # Deleted words
+                            run = p.add_run(''.join(words_a[wi1:wi2]))
+                            run.font.strike = True
+                            run.font.color.rgb = RGBColor(0xDC, 0x26, 0x26)
+                            # Inserted words
+                            run = p.add_run(''.join(words_b[wj1:wj2]))
+                            run.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
+                            run.font.underline = True
+                        elif wtag == 'delete':
+                            run = p.add_run(''.join(words_a[wi1:wi2]))
+                            run.font.strike = True
+                            run.font.color.rgb = RGBColor(0xDC, 0x26, 0x26)
+                        elif wtag == 'insert':
+                            run = p.add_run(''.join(words_b[wj1:wj2]))
+                            run.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
+                            run.font.underline = True
+                elif old_text:
+                    run = p.add_run(old_text)
+                    run.font.strike = True
+                    run.font.color.rgb = RGBColor(0xDC, 0x26, 0x26)
+
+            # Any remaining new paragraphs that don't have old counterparts
+            for idx in range(j1 + (i2 - i1), j2):
+                p = out_doc.add_paragraph()
+                run = p.add_run(paras_b[idx])
+                run.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
+                run.font.underline = True
+
+        elif tag == 'delete':
+            for idx in range(i1, i2):
+                p = out_doc.add_paragraph()
+                run = p.add_run(paras_a[idx])
+                run.font.strike = True
+                run.font.color.rgb = RGBColor(0xDC, 0x26, 0x26)
+
+        elif tag == 'insert':
+            for idx in range(j1, j2):
+                p = out_doc.add_paragraph()
+                run = p.add_run(paras_b[idx])
+                run.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
+                run.font.underline = True
+
+    # Add legend at the top
+    legend = out_doc.paragraphs[0] if out_doc.paragraphs else out_doc.add_paragraph()
+    out_doc.add_page_break()
+
+    # Insert legend before content
+    first_para = out_doc.add_paragraph()
+    first_para._element.addprevious(out_doc.add_paragraph()._element)
+
+    # Save
+    out_path = os.path.join(tmpdir, 'redline.docx')
+    out_doc.save(out_path)
+    return out_path
+
+
 @api.route('/export-changes/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
 def export_changed_pages(doc_id, version_a, version_b):
     """

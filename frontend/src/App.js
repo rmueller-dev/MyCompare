@@ -74,35 +74,56 @@ function ViewModeToggle({ mode, setMode }) {
   );
 }
 
-// ─── EXPORT BUTTON ───
-function ExportButton({ docId, versionA, versionB }) {
-  const [open, setOpen] = useState(false);
-
+// ─── DOWNLOAD BUTTONS ───
+function DownloadButtons({ docId, versionA, versionB, fileType }) {
   if (!docId || !versionA || !versionB) return null;
 
-  const doExport = (fmt) => {
-    window.open(`${API}/export-changes/${docId}/${versionA}/${versionB}?format=${fmt}`, '_blank');
-    setOpen(false);
+  const btnBase = "inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold transition-colors shadow-sm";
+
+  const typeLabels = { docx: 'Word', xlsx: 'Excel', pptx: 'PowerPoint', pdf: 'PDF' };
+  const typeColors = {
+    docx: 'bg-blue-600 hover:bg-blue-700 text-white',
+    xlsx: 'bg-green-600 hover:bg-green-700 text-white',
+    pptx: 'bg-orange-500 hover:bg-orange-600 text-white',
+    pdf:  'bg-red-600 hover:bg-red-700 text-white',
   };
 
   return (
-    <div className="relative inline-block">
-      <button onClick={() => setOpen(!open)}
-        className="bg-gray-100 text-gray-700 px-3 py-1.5 rounded text-sm font-medium hover:bg-gray-200 transition-colors">
-        Änderungen exportieren
-      </button>
-      {open && (
-        <div className="absolute right-0 mt-1 bg-white border rounded-lg shadow-lg z-10 py-1 w-48">
-          <button onClick={() => doExport('original')}
-            className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50">
-            Originalformat herunterladen
-          </button>
-          <button onClick={() => doExport('pdf')}
-            className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50">
-            Als PDF herunterladen
-          </button>
-        </div>
-      )}
+    <div className="bg-white border rounded-xl p-4 mb-4">
+      <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wider mb-3">Herunterladen</h3>
+      <div className="flex flex-wrap gap-3">
+        {/* Original format */}
+        <a href={`${API}/export-changes/${docId}/${versionA}/${versionB}?format=original`}
+          className={`${btnBase} ${typeColors[fileType] || 'bg-gray-600 hover:bg-gray-700 text-white'}`}
+          download>
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+          {typeLabels[fileType] || fileType?.toUpperCase()} herunterladen
+        </a>
+
+        {/* PDF */}
+        <a href={`${API}/export-changes/${docId}/${versionA}/${versionB}?format=pdf`}
+          className={`${btnBase} bg-red-600 hover:bg-red-700 text-white`}
+          download>
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+          Als PDF
+        </a>
+
+        {/* Redline (Word only) */}
+        {fileType === 'docx' && (
+          <a href={`${API}/redline/${docId}/${versionA}/${versionB}`}
+            className={`${btnBase} bg-purple-600 hover:bg-purple-700 text-white`}
+            download>
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+            </svg>
+            Word Änderungsmodus (Redline)
+          </a>
+        )}
+      </div>
     </div>
   );
 }
@@ -121,18 +142,21 @@ function DiffView({ diffResult }) {
     <div>
       <VerificationBadge verification={verification} />
 
+      {/* Download buttons — prominent */}
+      <DownloadButtons
+        docId={diffResult.document?.id}
+        versionA={diffResult.version_a?.version_number}
+        versionB={diffResult.version_b?.version_number}
+        fileType={diffResult.document?.file_type}
+      />
+
       <div className="mb-4 flex flex-wrap items-center gap-4 text-sm text-gray-600">
         <span>Inhaltsänderungen: <b>{contentChanges.length}</b></span>
         <span>Formatierungsänderungen: <b>{summary?.formatting_count || 0}</b></span>
         <span>Plaintext-Änderungen: <b>{summary?.plaintext_count}</b></span>
         <span>Zeilen alt: <b>{summary?.total_lines_a}</b></span>
         <span>Zeilen neu: <b>{summary?.total_lines_b}</b></span>
-        <div className="ml-auto flex gap-2 items-center">
-          <ExportButton
-            docId={diffResult.document?.id}
-            versionA={diffResult.version_a?.version_number}
-            versionB={diffResult.version_b?.version_number}
-          />
+        <div className="ml-auto">
           <ViewModeToggle mode={viewMode} setMode={setViewMode} />
         </div>
       </div>
