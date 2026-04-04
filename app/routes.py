@@ -288,9 +288,15 @@ def download_version(doc_id, ver_id):
 
 @api.route('/redline/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
 def generate_redline(doc_id, version_a, version_b):
-    """Generate a Word document with tracked changes (Änderungsmodus/Redline)."""
+    """
+    Generate a document with all changes visually marked.
+    Query param: format=original|pdf (default: original)
+    Works for DOCX, XLSX, PPTX, PDF.
+    """
     import tempfile
     import shutil
+
+    output_format = request.args.get('format', 'original')
 
     session = SessionLocal()
     try:
@@ -305,12 +311,26 @@ def generate_redline(doc_id, version_a, version_b):
 
         tmpdir = tempfile.mkdtemp()
         try:
-            if doc.file_type == 'docx':
-                out_path = _generate_docx_redline(ver_a.filepath, ver_b.filepath, tmpdir)
-            else:
-                return jsonify({'error': 'Änderungsmodus nur für DOCX verfügbar'}), 400
+            generators = {
+                'docx': _generate_docx_redline,
+                'xlsx': _generate_xlsx_redline,
+                'pptx': _generate_pptx_redline,
+                'pdf': _generate_pdf_redline,
+            }
+            gen = generators.get(doc.file_type)
+            if not gen:
+                return jsonify({'error': 'Nicht unterstützter Dateityp'}), 400
 
-            dl_name = f"{doc.name}_Redline_V{version_a}_vs_V{version_b}.docx"
+            out_path = gen(ver_a.filepath, ver_b.filepath, tmpdir)
+
+            # Convert to PDF if requested
+            if output_format == 'pdf' and not out_path.endswith('.pdf'):
+                pdf_path = _convert_to_pdf(out_path, tmpdir)
+                if pdf_path and pdf_path.endswith('.pdf'):
+                    out_path = pdf_path
+
+            ext = os.path.splitext(out_path)[1]
+            dl_name = f"{doc.name}_Aenderungen_V{version_a}_vs_V{version_b}{ext}"
             return send_from_directory(
                 os.path.dirname(out_path),
                 os.path.basename(out_path),
@@ -455,6 +475,249 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
     out_path = os.path.join(tmpdir, 'redline.docx')
     out_doc.save(out_path)
     return out_path
+
+
+def _generate_xlsx_redline(filepath_a, filepath_b, tmpdir):
+    """Generate an XLSX with changes highlighted: deleted cells red, new cells green, changed cells yellow."""
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill, Font
+    import copy
+
+    wb_a = load_workbook(filepath_a, data_only=True)
+    wb_b = load_workbook(filepath_b)
+
+    red_fill = PatternFill(start_color='FFFECACA', end_color='FFFECACA', fill_type='solid')
+    green_fill = PatternFill(start_color='FFBBF7D0', end_color='FFBBF7D0', fill_type='solid')
+    yellow_fill = PatternFill(start_color='FFFEF3C7', end_color='FFFEF3C7', fill_type='solid')
+    red_font = Font(color='DC2626', strikethrough=True)
+    blue_font = Font(color='2563EB', underline='single')
+
+    # Build value maps for A
+    vals_a = {}
+    for sn in wb_a.sheetnames:
+        ws = wb_a[sn]
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is not None:
+                    vals_a[f"{sn}!{cell.coordinate}"] = str(cell.value)
+
+    # Mark changes in B
+    for sn in wb_b.sheetnames:
+        ws = wb_b[sn]
+        for row in ws.iter_rows():
+            for cell in row:
+                key = f"{sn}!{cell.coordinate}"
+                val_b = str(cell.value) if cell.value is not None else None
+                val_a = vals_a.pop(key, None)
+
+                if val_a is None and val_b is not None:
+                    # New cell
+                    cell.fill = green_fill
+                    cell.font = blue_font
+                elif val_a is not None and val_b is not None and val_a != val_b:
+                    # Changed cell - show old → new
+                    cell.fill = yellow_fill
+                    cell.value = f"{val_b}  [war: {val_a}]"
+
+    # Add deleted cells info to a new sheet if any remain
+    if vals_a:
+        ws_del = wb_b.create_sheet('Gelöschte Zellen')
+        ws_del.cell(1, 1, 'Zelle').font = Font(bold=True)
+        ws_del.cell(1, 2, 'Alter Wert').font = Font(bold=True)
+        for i, (coord, val) in enumerate(sorted(vals_a.items()), 2):
+            ws_del.cell(i, 1, coord)
+            c = ws_del.cell(i, 2, val)
+            c.fill = red_fill
+            c.font = red_font
+
+    out_path = os.path.join(tmpdir, 'redline.xlsx')
+    wb_b.save(out_path)
+    return out_path
+
+
+def _generate_pptx_redline(filepath_a, filepath_b, tmpdir):
+    """Generate a PPTX with a summary slide showing all changes."""
+    from pptx import Presentation
+    from pptx.util import Inches, Pt, Emu
+    from pptx.dml.color import RGBColor as PptxRGB
+    import difflib
+
+    prs_a = Presentation(filepath_a)
+    prs_b = Presentation(filepath_b)
+
+    # Extract text per slide
+    def slide_texts(prs):
+        result = []
+        for slide in prs.slides:
+            texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    texts.append(shape.text_frame.text)
+            result.append('\n'.join(texts))
+        return result
+
+    texts_a = slide_texts(prs_a)
+    texts_b = slide_texts(prs_b)
+
+    # Add a summary slide at the beginning of prs_b
+    from pptx.util import Inches, Pt
+    slide_layout = prs_b.slide_layouts[6]  # blank layout
+    summary = prs_b.slides.add_slide(slide_layout)
+
+    # Move summary to first position
+    xml_slides = prs_b.slides._sldIdLst
+    slides_list = list(xml_slides)
+    last = slides_list[-1]
+    xml_slides.remove(last)
+    xml_slides.insert(0, last)
+
+    # Add title
+    from pptx.util import Inches
+    txBox = summary.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.6))
+    tf = txBox.text_frame
+    p = tf.paragraphs[0]
+    p.text = "Änderungsübersicht"
+    p.font.size = Pt(24)
+    p.font.bold = True
+
+    # Diff and list changes
+    sm = difflib.SequenceMatcher(None, texts_a, texts_b, autojunk=False)
+    y_pos = Inches(1.2)
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+
+        txBox = summary.shapes.add_textbox(Inches(0.5), y_pos, Inches(9), Inches(0.8))
+        tf = txBox.text_frame
+        tf.word_wrap = True
+
+        if tag == 'replace':
+            for idx in range(max(i2 - i1, j2 - j1)):
+                old_t = texts_a[i1 + idx][:80] if (i1 + idx) < i2 else ''
+                new_t = texts_b[j1 + idx][:80] if (j1 + idx) < j2 else ''
+                p = tf.add_paragraph() if tf.paragraphs[0].text else tf.paragraphs[0]
+                p.font.size = Pt(10)
+                run_label = p.add_run()
+                run_label.text = f"Folie {j1 + idx + 1}: "
+                run_label.font.bold = True
+                run_del = p.add_run()
+                run_del.text = old_t
+                run_del.font.color.rgb = PptxRGB(0xDC, 0x26, 0x26)
+                run_del.font.strikethrough = True
+                run_del.font.size = Pt(9)
+                run_arrow = p.add_run()
+                run_arrow.text = " → "
+                run_new = p.add_run()
+                run_new.text = new_t
+                run_new.font.color.rgb = PptxRGB(0x25, 0x63, 0xEB)
+                run_new.font.underline = True
+                run_new.font.size = Pt(9)
+        elif tag == 'delete':
+            p = tf.paragraphs[0]
+            p.font.size = Pt(10)
+            run = p.add_run()
+            run.text = f"Folien {i1+1}-{i2} gelöscht"
+            run.font.color.rgb = PptxRGB(0xDC, 0x26, 0x26)
+        elif tag == 'insert':
+            p = tf.paragraphs[0]
+            p.font.size = Pt(10)
+            run = p.add_run()
+            run.text = f"Folien {j1+1}-{j2} neu eingefügt"
+            run.font.color.rgb = PptxRGB(0x25, 0x63, 0xEB)
+
+        y_pos += Inches(0.9)
+        if y_pos > Inches(7):
+            break  # Prevent overflow
+
+    out_path = os.path.join(tmpdir, 'redline.pptx')
+    prs_b.save(out_path)
+    return out_path
+
+
+def _generate_pdf_redline(filepath_a, filepath_b, tmpdir):
+    """Generate a PDF showing changes between two PDF versions as a text-based diff report."""
+    import pdfplumber
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.colors import red, blue, black, HexColor
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.units import mm
+    import difflib
+
+    # Extract text
+    def pdf_text(path):
+        pages = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                pages.append(page.extract_text() or '')
+        return pages
+
+    try:
+        pages_a = pdf_text(filepath_a)
+        pages_b = pdf_text(filepath_b)
+    except Exception:
+        # If reportlab not available, fall back to simple copy
+        import shutil
+        out_path = os.path.join(tmpdir, 'redline.pdf')
+        shutil.copy2(filepath_b, out_path)
+        return out_path
+
+    try:
+        out_path = os.path.join(tmpdir, 'redline.pdf')
+        doc_pdf = SimpleDocTemplate(out_path, pagesize=A4,
+                                     leftMargin=20*mm, rightMargin=20*mm,
+                                     topMargin=20*mm, bottomMargin=20*mm)
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('Title2', parent=styles['Title'], fontSize=16)
+        normal = ParagraphStyle('Normal2', parent=styles['Normal'], fontSize=9, leading=12)
+        del_style = ParagraphStyle('Del', parent=normal, textColor=red)
+        add_style = ParagraphStyle('Add', parent=normal, textColor=blue)
+        heading = ParagraphStyle('H', parent=styles['Heading2'], fontSize=12)
+
+        story = []
+        story.append(Paragraph("Änderungsbericht", title_style))
+        story.append(Spacer(1, 10*mm))
+
+        text_a = '\n'.join(pages_a)
+        text_b = '\n'.join(pages_b)
+        lines_a = text_a.splitlines()
+        lines_b = text_b.splitlines()
+
+        sm = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+        change_num = 0
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == 'equal':
+                continue
+            change_num += 1
+            story.append(Paragraph(f"Änderung {change_num} (Zeile {i1+1})", heading))
+
+            if tag in ('replace', 'delete'):
+                for idx in range(i1, min(i2, i1 + 20)):
+                    safe = lines_a[idx].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    story.append(Paragraph(f'<strike><font color="red">- {safe}</font></strike>', normal))
+
+            if tag in ('replace', 'insert'):
+                for idx in range(j1, min(j2, j1 + 20)):
+                    safe = lines_b[idx].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    story.append(Paragraph(f'<font color="blue"><u>+ {safe}</u></font>', normal))
+
+            story.append(Spacer(1, 5*mm))
+
+        if change_num == 0:
+            story.append(Paragraph("Keine Änderungen erkannt.", normal))
+
+        doc_pdf.build(story)
+        return out_path
+
+    except ImportError:
+        # reportlab not installed — copy original
+        import shutil
+        out_path = os.path.join(tmpdir, 'redline.pdf')
+        shutil.copy2(filepath_b, out_path)
+        return out_path
 
 
 @api.route('/export-changes/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
