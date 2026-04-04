@@ -365,6 +365,49 @@ def download_version(doc_id, ver_id):
         session.close()
 
 
+@api.route('/change-report/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
+def change_report(doc_id, version_a, version_b):
+    """Generate a separate DOCX change report with statistics and colored change list."""
+    import tempfile
+    import shutil
+
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        if not doc:
+            return jsonify({'error': 'Dokument nicht gefunden'}), 404
+
+        ver_a = session.query(Version).filter_by(document_id=doc_id, version_number=version_a).first()
+        ver_b = session.query(Version).filter_by(document_id=doc_id, version_number=version_b).first()
+        if not ver_a or not ver_b:
+            return jsonify({'error': 'Version nicht gefunden'}), 404
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            out_path = _generate_docx_report(ver_a.filepath, ver_b.filepath, tmpdir)
+            dl_name = f"{doc.name}_Aenderungsbericht_V{version_a}_vs_V{version_b}.docx"
+            return send_from_directory(
+                os.path.dirname(out_path),
+                os.path.basename(out_path),
+                as_attachment=True,
+                download_name=dl_name,
+            )
+        finally:
+            import threading
+            def cleanup():
+                import time
+                time.sleep(10)
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            threading.Thread(target=cleanup, daemon=True).start()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': 'Berichterstellung fehlgeschlagen.'}), 500
+    finally:
+        session.close()
+
+
 @api.route('/redline/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
 def generate_redline(doc_id, version_a, version_b):
     """
@@ -717,166 +760,357 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                     r_ins = make_run_element(paras_b[idx] or '')
                     p_el.append(wrap_in_ins(r_ins))
 
-    # ── Build Summary / Change Report pages (prepend to body) ──
-    type_counts = Counter(c['type'] for c in all_changes)
-    total_changes = len(all_changes)
-
-    # We build XML elements and insert them at the beginning of body
-    summary_elements = []
-
-    def make_para(text, bold=False, size=24, color='1F3864', align='left', space_after=120):
-        """Create a formatted paragraph element for the summary."""
-        p = etree.Element(f'{{{W}}}p')
-        ppr = etree.SubElement(p, f'{{{W}}}pPr')
-        if align == 'center':
-            jc = etree.SubElement(ppr, f'{{{W}}}jc')
-            jc.set(f'{{{W}}}val', 'center')
-        spacing = etree.SubElement(ppr, f'{{{W}}}spacing')
-        spacing.set(f'{{{W}}}after', str(space_after))
-        r = etree.SubElement(p, f'{{{W}}}r')
-        rpr = etree.SubElement(r, f'{{{W}}}rPr')
-        sz = etree.SubElement(rpr, f'{{{W}}}sz')
-        sz.set(f'{{{W}}}val', str(size))
-        sz_cs = etree.SubElement(rpr, f'{{{W}}}szCs')
-        sz_cs.set(f'{{{W}}}val', str(size))
-        if bold:
-            b = etree.SubElement(rpr, f'{{{W}}}b')
-        if color:
-            c_el = etree.SubElement(rpr, f'{{{W}}}color')
-            c_el.set(f'{{{W}}}val', color)
-        t = etree.SubElement(r, f'{{{W}}}t')
-        t.text = text
-        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        return p
-
-    def make_table_row(cells, bold=False, bg_color=None, font_color='000000', size=18):
-        """Create a table row with cells."""
-        tr = etree.Element(f'{{{W}}}tr')
-        for cell_text in cells:
-            tc = etree.SubElement(tr, f'{{{W}}}tc')
-            tcp = etree.SubElement(tc, f'{{{W}}}tcPr')
-            if bg_color:
-                shd = etree.SubElement(tcp, f'{{{W}}}shd')
-                shd.set(f'{{{W}}}val', 'clear')
-                shd.set(f'{{{W}}}fill', bg_color)
-            # Borders
-            tcb = etree.SubElement(tcp, f'{{{W}}}tcBorders')
-            for side in ('top', 'bottom', 'left', 'right'):
-                b_el = etree.SubElement(tcb, f'{{{W}}}{side}')
-                b_el.set(f'{{{W}}}val', 'single')
-                b_el.set(f'{{{W}}}sz', '4')
-                b_el.set(f'{{{W}}}color', 'BDBDBD')
-            p = etree.SubElement(tc, f'{{{W}}}p')
-            r = etree.SubElement(p, f'{{{W}}}r')
-            rpr = etree.SubElement(r, f'{{{W}}}rPr')
-            sz_el = etree.SubElement(rpr, f'{{{W}}}sz')
-            sz_el.set(f'{{{W}}}val', str(size))
-            sz_cs = etree.SubElement(rpr, f'{{{W}}}szCs')
-            sz_cs.set(f'{{{W}}}val', str(size))
-            if bold:
-                etree.SubElement(rpr, f'{{{W}}}b')
-            c_el = etree.SubElement(rpr, f'{{{W}}}color')
-            c_el.set(f'{{{W}}}val', font_color)
-            t = etree.SubElement(r, f'{{{W}}}t')
-            t.text = str(cell_text)
-            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        return tr
-
-    # ─── Page 1: Title & Legend ───
-    summary_elements.append(make_para('Änderungsbericht', bold=True, size=36, color='1565C0', align='center'))
-    summary_elements.append(make_para('MyCompare — Dokumentenvergleich', bold=False, size=22, color='666666', align='center', space_after=300))
-    summary_elements.append(make_para(f'Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M")}', bold=False, size=18, color='999999', align='center', space_after=600))
-
-    # Legend section
-    summary_elements.append(make_para('Legende', bold=True, size=26, color='1F3864'))
-    legend_items = [
-        ('Eingefügt (Tracked Change)', 'Blau unterstrichen — Text der in der neuen Version hinzugefügt wurde', '1565C0'),
-        ('Gelöscht (Tracked Change)', 'Rot durchgestrichen — Text der aus der alten Version entfernt wurde', 'C62828'),
-        ('Ersetzung', 'Gelöschter Text (rot) gefolgt von eingefügtem Text (blau)', '333333'),
-        ('Verschoben', 'Text der an eine andere Stelle im Dokument verschoben wurde', '6A1B9A'),
-    ]
-    for title, desc, color in legend_items:
-        summary_elements.append(make_para(f'  {title}', bold=True, size=20, color=color, space_after=40))
-        summary_elements.append(make_para(f'    {desc}', bold=False, size=18, color='666666', space_after=160))
-
-    # ─── Page 2: Statistics & Change List ───
-    # Page break
-    pb_para = etree.Element(f'{{{W}}}p')
-    pb_r = etree.SubElement(pb_para, f'{{{W}}}r')
-    pb_br = etree.SubElement(pb_r, f'{{{W}}}br')
-    pb_br.set(f'{{{W}}}type', 'page')
-    summary_elements.append(pb_para)
-
-    summary_elements.append(make_para('Änderungsstatistik', bold=True, size=26, color='1F3864'))
-
-    # Statistics table
-    stats_tbl = etree.Element(f'{{{W}}}tbl')
-    stats_tblpr = etree.SubElement(stats_tbl, f'{{{W}}}tblPr')
-    stats_tblw = etree.SubElement(stats_tblpr, f'{{{W}}}tblW')
-    stats_tblw.set(f'{{{W}}}w', '5000')
-    stats_tblw.set(f'{{{W}}}type', 'pct')
-
-    stats_tbl.append(make_table_row(['Änderungstyp', 'Anzahl'], bold=True, bg_color='1565C0', font_color='FFFFFF'))
-    type_colors = {
-        'Einfügung': 'E8F5E9', 'Löschung': 'FFEBEE', 'Ersetzung': 'FFF8E1',
-        'Verschoben (Quelle)': 'F3E5F5', 'Verschoben (Ziel)': 'F3E5F5',
-    }
-    for ctype, count in type_counts.most_common():
-        bg = type_colors.get(ctype, 'F5F5F5')
-        stats_tbl.append(make_table_row([ctype, str(count)], bg_color=bg))
-    stats_tbl.append(make_table_row(['Gesamt', str(total_changes)], bold=True, bg_color='E3F2FD'))
-    summary_elements.append(stats_tbl)
-
-    summary_elements.append(make_para('', size=10, space_after=300))  # spacer
-
-    # ─── Change List (numbered) ───
-    summary_elements.append(make_para('Änderungsliste', bold=True, size=26, color='1F3864'))
-
-    changes_tbl = etree.Element(f'{{{W}}}tbl')
-    changes_tblpr = etree.SubElement(changes_tbl, f'{{{W}}}tblPr')
-    changes_tblw = etree.SubElement(changes_tblpr, f'{{{W}}}tblW')
-    changes_tblw.set(f'{{{W}}}w', '5000')
-    changes_tblw.set(f'{{{W}}}type', 'pct')
-
-    changes_tbl.append(make_table_row(['Nr.', 'Typ', 'Alter Text', 'Neuer Text'], bold=True, bg_color='1565C0', font_color='FFFFFF'))
-
-    for change in all_changes[:200]:
-        old_display = change['old'] if change['old'] else '—'
-        new_display = change['new'] if change['new'] else '—'
-        type_bg = type_colors.get(change['type'], 'F5F5F5')
-        changes_tbl.append(make_table_row(
-            [str(change['num']), change['type'], old_display, new_display],
-            bg_color=type_bg, size=16
-        ))
-
-    if total_changes > 200:
-        changes_tbl.append(make_table_row(
-            ['', f'... und {total_changes - 200} weitere Änderungen', '', ''],
-            font_color='999999', size=16
-        ))
-
-    summary_elements.append(changes_tbl)
-
-    # Page break before redline content
-    pb_para2 = etree.Element(f'{{{W}}}p')
-    pb_r2 = etree.SubElement(pb_para2, f'{{{W}}}r')
-    pb_br2 = etree.SubElement(pb_r2, f'{{{W}}}br')
-    pb_br2.set(f'{{{W}}}type', 'page')
-    summary_elements.append(pb_para2)
-
-    summary_elements.append(make_para('Redline-Dokument', bold=True, size=26, color='1F3864', space_after=300))
-
-    # Insert summary elements at the beginning of body
-    first_child = body[0] if len(body) > 0 else None
-    for elem in reversed(summary_elements):
-        if first_child is not None:
-            body.insert(list(body).index(first_child), elem)
-        else:
-            body.append(elem)
-
     out_path = os.path.join(tmpdir, 'redline.docx')
     out_doc.save(out_path)
     return out_path
+
+
+def _generate_docx_report(filepath_a, filepath_b, tmpdir):
+    """
+    Generate a separate DOCX change report with:
+    - Änderungsstatistik (statistics table)
+    - Änderungsliste with colored markup (red strikethrough / blue underline / purple moved)
+    Uses python-docx for clean, well-formatted output.
+    """
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Inches, Cm, Emu
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    import difflib
+    import re
+    from datetime import datetime
+    from collections import Counter
+
+    doc_a = DocxDocument(filepath_a)
+    doc_b = DocxDocument(filepath_b)
+    paras_a = [p.text or '' for p in doc_a.paragraphs]
+    paras_b = [p.text or '' for p in doc_b.paragraphs]
+
+    # ── Move detection ──
+    sm_pre = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
+    deleted_paras = {}
+    inserted_paras = {}
+    for tag, i1, i2, j1, j2 in sm_pre.get_opcodes():
+        if tag == 'delete':
+            for idx in range(i1, i2):
+                txt = paras_a[idx].strip()
+                if txt and len(txt) > 10:
+                    deleted_paras.setdefault(txt, []).append(idx)
+        elif tag == 'insert':
+            for idx in range(j1, j2):
+                txt = paras_b[idx].strip()
+                if txt and len(txt) > 10:
+                    inserted_paras.setdefault(txt, []).append(idx)
+
+    moved_from_a = set()
+    moved_to_b = set()
+    for txt in deleted_paras:
+        if txt in inserted_paras:
+            for a_idx, b_idx in zip(deleted_paras[txt], inserted_paras[txt]):
+                moved_from_a.add(a_idx)
+                moved_to_b.add(b_idx)
+
+    # ── Collect all changes ──
+    all_changes = []
+    change_counter = [0]
+
+    def record_change(change_type, old_text='', new_text=''):
+        change_counter[0] += 1
+        all_changes.append({
+            'num': change_counter[0],
+            'type': change_type,
+            'old': old_text or '',
+            'new': new_text or '',
+        })
+
+    sm = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
+    opcodes = sm.get_opcodes()
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == 'replace':
+            for idx in range(max(i2 - i1, j2 - j1)):
+                old_idx = i1 + idx if (i1 + idx) < i2 else None
+                new_idx = j1 + idx if (j1 + idx) < j2 else None
+                old_text = paras_a[old_idx] if old_idx is not None else ''
+                new_text = paras_b[new_idx] if new_idx is not None else ''
+                if old_text and new_text:
+                    record_change('Ersetzung', old_text, new_text)
+                elif old_text:
+                    record_change('Löschung', old_text)
+                elif new_text:
+                    record_change('Einfügung', new_text=new_text)
+        elif tag == 'delete':
+            for idx in range(i1, i2):
+                if idx in moved_from_a:
+                    record_change('Verschoben (Quelle)', paras_a[idx])
+                else:
+                    record_change('Löschung', paras_a[idx])
+        elif tag == 'insert':
+            for idx in range(j1, j2):
+                if idx in moved_to_b:
+                    record_change('Verschoben (Ziel)', new_text=paras_b[idx])
+                else:
+                    record_change('Einfügung', new_text=paras_b[idx])
+
+    type_counts = Counter(c['type'] for c in all_changes)
+    total_changes = len(all_changes)
+
+    # ── Colors ──
+    CLR_INS = RGBColor(0x15, 0x65, 0xC0)   # blue
+    CLR_DEL = RGBColor(0xC6, 0x28, 0x28)   # red
+    CLR_MOVE = RGBColor(0x6A, 0x1B, 0x9A)  # purple
+    CLR_TITLE = RGBColor(0x1F, 0x38, 0x64)
+    CLR_GREY = RGBColor(0x66, 0x66, 0x66)
+    CLR_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+
+    type_bg_colors = {
+        'Einfügung': 'E8F5E9', 'Löschung': 'FFEBEE', 'Ersetzung': 'FFF8E1',
+        'Verschoben (Quelle)': 'F3E5F5', 'Verschoben (Ziel)': 'F3E5F5',
+    }
+
+    def set_cell_bg(cell, hex_color):
+        """Set cell background color."""
+        shading = OxmlElement('w:shd')
+        shading.set(qn('w:val'), 'clear')
+        shading.set(qn('w:fill'), hex_color)
+        cell._tc.get_or_add_tcPr().append(shading)
+
+    def add_markup_runs(paragraph, change):
+        """Add colored markup runs to a paragraph based on change type."""
+        ctype = change['type']
+        old = change['old']
+        new = change['new']
+
+        if ctype == 'Ersetzung' and old and new:
+            # Word-level diff with colored markup
+            words_a = re.findall(r'\S+|\s+', old)
+            words_b = re.findall(r'\S+|\s+', new)
+            wsm = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
+            for wtag, wi1, wi2, wj1, wj2 in wsm.get_opcodes():
+                if wtag == 'equal':
+                    run = paragraph.add_run(''.join(words_b[wj1:wj2]))
+                    run.font.size = Pt(8)
+                elif wtag == 'replace':
+                    run_del = paragraph.add_run(''.join(words_a[wi1:wi2]))
+                    run_del.font.size = Pt(8)
+                    run_del.font.color.rgb = CLR_DEL
+                    run_del.font.strike = True
+                    run_ins = paragraph.add_run(''.join(words_b[wj1:wj2]))
+                    run_ins.font.size = Pt(8)
+                    run_ins.font.color.rgb = CLR_INS
+                    run_ins.font.underline = True
+                elif wtag == 'delete':
+                    run_del = paragraph.add_run(''.join(words_a[wi1:wi2]))
+                    run_del.font.size = Pt(8)
+                    run_del.font.color.rgb = CLR_DEL
+                    run_del.font.strike = True
+                elif wtag == 'insert':
+                    run_ins = paragraph.add_run(''.join(words_b[wj1:wj2]))
+                    run_ins.font.size = Pt(8)
+                    run_ins.font.color.rgb = CLR_INS
+                    run_ins.font.underline = True
+
+        elif ctype in ('Löschung', 'Verschoben (Quelle)'):
+            color = CLR_MOVE if 'Verschoben' in ctype else CLR_DEL
+            run = paragraph.add_run(old[:200])
+            run.font.size = Pt(8)
+            run.font.color.rgb = color
+            run.font.strike = True
+            if 'Verschoben' in ctype:
+                tag_run = paragraph.add_run(' [verschoben]')
+                tag_run.font.size = Pt(7)
+                tag_run.font.color.rgb = CLR_MOVE
+                tag_run.font.italic = True
+
+        elif ctype in ('Einfügung', 'Verschoben (Ziel)'):
+            color = CLR_MOVE if 'Verschoben' in ctype else CLR_INS
+            run = paragraph.add_run(new[:200])
+            run.font.size = Pt(8)
+            run.font.color.rgb = color
+            run.font.underline = True
+            if 'Verschoben' in ctype:
+                tag_run = paragraph.add_run(' [hierhin verschoben]')
+                tag_run.font.size = Pt(7)
+                tag_run.font.color.rgb = CLR_MOVE
+                tag_run.font.italic = True
+        else:
+            run = paragraph.add_run(old or new or '—')
+            run.font.size = Pt(8)
+
+    # ── Build report document ──
+    report = DocxDocument()
+
+    # Narrow margins
+    for section in report.sections:
+        section.left_margin = Cm(2)
+        section.right_margin = Cm(2)
+        section.top_margin = Cm(1.5)
+        section.bottom_margin = Cm(1.5)
+
+    # Title
+    p_title = report.add_paragraph()
+    p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p_title.add_run('Änderungsbericht')
+    run.font.size = Pt(22)
+    run.font.bold = True
+    run.font.color.rgb = RGBColor(0x15, 0x65, 0xC0)
+
+    p_sub = report.add_paragraph()
+    p_sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p_sub.add_run('MyCompare — Dokumentenvergleich')
+    run.font.size = Pt(11)
+    run.font.color.rgb = CLR_GREY
+
+    p_date = report.add_paragraph()
+    p_date.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p_date.add_run(f'Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M")}')
+    run.font.size = Pt(9)
+    run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+
+    # ─── Legende ───
+    p_h = report.add_paragraph()
+    run = p_h.add_run('Legende')
+    run.font.size = Pt(14)
+    run.font.bold = True
+    run.font.color.rgb = CLR_TITLE
+
+    legend_items = [
+        ('Eingefügt', 'Text der in der neuen Version hinzugefügt wurde', CLR_INS, False, True),
+        ('Gelöscht', 'Text der aus der alten Version entfernt wurde', CLR_DEL, True, False),
+        ('Ersetzung', 'Gelöschter Text (rot) gefolgt von neuem Text (blau)', CLR_GREY, False, False),
+        ('Verschoben', 'Text der an eine andere Stelle verschoben wurde', CLR_MOVE, False, False),
+    ]
+    for label, desc, color, strike, underline in legend_items:
+        p = report.add_paragraph()
+        r1 = p.add_run(f'  {label}')
+        r1.font.size = Pt(10)
+        r1.font.bold = True
+        r1.font.color.rgb = color
+        if strike:
+            r1.font.strike = True
+        if underline:
+            r1.font.underline = True
+        r2 = p.add_run(f'  — {desc}')
+        r2.font.size = Pt(9)
+        r2.font.color.rgb = CLR_GREY
+
+    # ─── Änderungsstatistik ───
+    p_h = report.add_paragraph()
+    run = p_h.add_run('Änderungsstatistik')
+    run.font.size = Pt(14)
+    run.font.bold = True
+    run.font.color.rgb = CLR_TITLE
+
+    stats_table = report.add_table(rows=1, cols=2)
+    stats_table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    hdr = stats_table.rows[0].cells
+    hdr[0].text = 'Änderungstyp'
+    hdr[1].text = 'Anzahl'
+    for cell in hdr:
+        set_cell_bg(cell, '1565C0')
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.bold = True
+                r.font.color.rgb = CLR_WHITE
+                r.font.size = Pt(9)
+
+    for ctype, count in type_counts.most_common():
+        row = stats_table.add_row().cells
+        row[0].text = ctype
+        row[1].text = str(count)
+        bg = type_bg_colors.get(ctype, 'F5F5F5')
+        for cell in row:
+            set_cell_bg(cell, bg)
+            for p in cell.paragraphs:
+                for r in p.runs:
+                    r.font.size = Pt(9)
+
+    total_row = stats_table.add_row().cells
+    total_row[0].text = 'Gesamt'
+    total_row[1].text = str(total_changes)
+    for cell in total_row:
+        set_cell_bg(cell, 'E3F2FD')
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.bold = True
+                r.font.size = Pt(10)
+
+    # ─── Änderungsliste with colored markup ───
+    report.add_page_break()
+
+    p_h = report.add_paragraph()
+    run = p_h.add_run('Änderungsliste')
+    run.font.size = Pt(14)
+    run.font.bold = True
+    run.font.color.rgb = CLR_TITLE
+
+    changes_table = report.add_table(rows=1, cols=3)
+    changes_table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    hdr = changes_table.rows[0].cells
+    hdr[0].text = 'Nr.'
+    hdr[1].text = 'Typ'
+    hdr[2].text = 'Änderung'
+    for cell in hdr:
+        set_cell_bg(cell, '1565C0')
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.bold = True
+                r.font.color.rgb = CLR_WHITE
+                r.font.size = Pt(9)
+
+    for change in all_changes[:300]:
+        row = changes_table.add_row().cells
+        # Nr.
+        row[0].text = str(change['num'])
+        for p in row[0].paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(8)
+
+        # Typ
+        row[1].text = change['type']
+        type_color = {
+            'Einfügung': CLR_INS, 'Löschung': CLR_DEL,
+            'Ersetzung': CLR_GREY,
+            'Verschoben (Quelle)': CLR_MOVE, 'Verschoben (Ziel)': CLR_MOVE,
+        }.get(change['type'], CLR_GREY)
+        for p in row[1].paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(8)
+                r.font.bold = True
+                r.font.color.rgb = type_color
+
+        # Änderung — colored markup
+        markup_para = row[2].paragraphs[0]
+        markup_para.clear()
+        add_markup_runs(markup_para, change)
+
+        # Row background
+        bg = type_bg_colors.get(change['type'], 'F5F5F5')
+        for cell in row:
+            set_cell_bg(cell, bg)
+
+    if total_changes > 300:
+        row = changes_table.add_row().cells
+        row[0].text = ''
+        row[1].merge(row[2])
+        row[1].text = f'... und {total_changes - 300} weitere Änderungen'
+        for p in row[1].paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(8)
+                r.font.italic = True
+                r.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+
+    # Set column widths
+    for row in changes_table.rows:
+        row.cells[0].width = Cm(1.2)
+        row.cells[1].width = Cm(3)
+        row.cells[2].width = Cm(13)
+
+    report_path = os.path.join(tmpdir, 'report.docx')
+    report.save(report_path)
+    return report_path
 
 
 def _generate_xlsx_redline(filepath_a, filepath_b, tmpdir):
