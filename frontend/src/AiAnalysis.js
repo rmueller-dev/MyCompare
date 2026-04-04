@@ -12,6 +12,14 @@ export default function AiAnalysis({ docId, versionA, versionB, onClose }) {
   const [ollamaAvailable, setOllamaAvailable] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    if (step !== 'loading') return;
+    setElapsed(0);
+    const iv = setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => clearInterval(iv);
+  }, [step]);
 
   useEffect(() => {
     fetch(`${API}/ai/status`)
@@ -181,13 +189,42 @@ export default function AiAnalysis({ docId, versionA, versionB, onClose }) {
             </div>
           )}
 
-          {step === 'loading' && (
-            <div className="text-center py-12">
-              <div className="inline-block w-10 h-10 border-4 border-violet-200 border-t-violet-600 rounded-full animate-spin mb-4"></div>
-              <p className="text-gray-600 font-medium">AI analysiert die Änderungen...</p>
-              <p className="text-gray-400 text-sm mt-1">Dies kann je nach Modell 1-3 Minuten dauern.</p>
-            </div>
-          )}
+          {step === 'loading' && (() => {
+            const estimatedSec = 180; // ~3 min estimate
+            const pct = Math.min(95, Math.round((elapsed / estimatedSec) * 100));
+            const mins = Math.floor(elapsed / 60);
+            const secs = elapsed % 60;
+            const phases = [
+              [0, 'Änderungen werden aufbereitet...'],
+              [10, 'Prompt wird an LLM gesendet...'],
+              [20, 'AI analysiert die Klauseln...'],
+              [40, 'Risikobewertung läuft...'],
+              [60, 'Issue List wird erstellt...'],
+              [80, 'Empfehlungen werden formuliert...'],
+              [90, 'Analyse wird abgeschlossen...'],
+            ];
+            const phase = [...phases].reverse().find(([p]) => pct >= p)?.[1] || phases[0][1];
+            return (
+              <div className="py-8 space-y-6">
+                <div className="text-center">
+                  <div className="inline-block w-10 h-10 border-4 border-violet-200 border-t-violet-600 rounded-full animate-spin mb-3"></div>
+                  <p className="text-gray-700 font-semibold">{phase}</p>
+                  <p className="text-gray-400 text-sm mt-1">
+                    {mins > 0 ? `${mins}:${secs.toString().padStart(2, '0')}` : `${secs}s`} vergangen
+                  </p>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-violet-500 to-purple-600 rounded-full transition-all duration-1000 ease-out"
+                    style={{ width: `${pct}%` }}
+                  ></div>
+                </div>
+                <p className="text-center text-xs text-gray-400">
+                  Geschätzt ca. 2-3 Minuten mit {model || 'qwen2.5:14b'}
+                </p>
+              </div>
+            );
+          })()}
 
           {step === 'error' && (
             <div className="space-y-4">
