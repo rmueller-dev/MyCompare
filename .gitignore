@@ -6,3 +6,4 @@ storage/
 frontend/node_modules/
 frontend/build/
 .env
+.claude/
