@@ -6,6 +6,7 @@ from werkzeug.utils import secure_filename
 from .models import SessionLocal, Document, Version, STORAGE_DIR
 from .extractors import extract
 from .diff_engine import compute_diff
+from .image_diff import extract_images, compare_images
 
 api = Blueprint('api', __name__, url_prefix='/api')
 
@@ -180,6 +181,27 @@ def diff_versions(doc_id, version_a, version_b):
         # Compute diff with verification
         result = compute_diff(struct_a, text_a, struct_b, text_b, doc.file_type, options)
 
+        # Add pixel-level image comparison for DOCX/PPTX
+        if doc.file_type in ('docx', 'pptx'):
+            try:
+                imgs_a = extract_images(ver_a.filepath, doc.file_type)
+                imgs_b = extract_images(ver_b.filepath, doc.file_type)
+                image_changes = compare_images(imgs_a, imgs_b)
+                # Filter out unchanged images to reduce payload
+                result['image_changes'] = [
+                    ic for ic in image_changes if ic['type'] != 'unchanged'
+                ]
+                result['image_summary'] = {
+                    'total': len(image_changes),
+                    'added': sum(1 for ic in image_changes if ic['type'] == 'added'),
+                    'removed': sum(1 for ic in image_changes if ic['type'] == 'removed'),
+                    'changed': sum(1 for ic in image_changes if ic['type'] == 'changed'),
+                    'unchanged': sum(1 for ic in image_changes if ic['type'] == 'unchanged'),
+                }
+            except Exception:
+                result['image_changes'] = []
+                result['image_summary'] = None
+
         result['version_a'] = ver_a.to_dict()
         result['version_b'] = ver_b.to_dict()
         result['document'] = doc.to_dict()
@@ -268,6 +290,26 @@ def quick_compare():
             'ignore_headers_footers': request.form.get('ignore_headers_footers') == '1',
         }
         result = compute_diff(struct_a, text_a, struct_b, text_b, file_type, options)
+
+        # Add pixel-level image comparison for DOCX/PPTX
+        if file_type in ('docx', 'pptx'):
+            try:
+                imgs_a = extract_images(versions[0].filepath, file_type)
+                imgs_b = extract_images(versions[1].filepath, file_type)
+                image_changes = compare_images(imgs_a, imgs_b)
+                result['image_changes'] = [
+                    ic for ic in image_changes if ic['type'] != 'unchanged'
+                ]
+                result['image_summary'] = {
+                    'total': len(image_changes),
+                    'added': sum(1 for ic in image_changes if ic['type'] == 'added'),
+                    'removed': sum(1 for ic in image_changes if ic['type'] == 'removed'),
+                    'changed': sum(1 for ic in image_changes if ic['type'] == 'changed'),
+                    'unchanged': sum(1 for ic in image_changes if ic['type'] == 'unchanged'),
+                }
+            except Exception:
+                result['image_changes'] = []
+                result['image_summary'] = None
 
         result['version_a'] = versions[0].to_dict()
         result['version_b'] = versions[1].to_dict()
@@ -1435,6 +1477,90 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
         row.cells[1].width = Cm(2.5)
         row.cells[2].width = Cm(7)
         row.cells[3].width = Cm(7)
+
+    # ─── Bildvergleich (Image Changes) ───
+    try:
+        imgs_a = extract_images(filepath_a, 'docx')
+        imgs_b = extract_images(filepath_b, 'docx')
+        image_changes = compare_images(imgs_a, imgs_b)
+        # Only include non-unchanged images
+        changed_images = [ic for ic in image_changes if ic['type'] != 'unchanged']
+
+        if changed_images:
+            report.add_page_break()
+
+            p_h = report.add_paragraph()
+            run = p_h.add_run('Bildvergleich')
+            run.font.size = Pt(14)
+            run.font.bold = True
+            run.font.color.rgb = CLR_TITLE
+
+            p_desc = report.add_paragraph()
+            run = p_desc.add_run(
+                f'{len(changed_images)} Bildänderung(en) gefunden '
+                f'(von {len(image_changes)} Bildern insgesamt).'
+            )
+            run.font.size = Pt(9)
+            run.font.color.rgb = CLR_GREY
+
+            img_table = report.add_table(rows=1, cols=4)
+            img_table.alignment = WD_TABLE_ALIGNMENT.LEFT
+            hdr = img_table.rows[0].cells
+            hdr[0].text = 'Nr.'
+            hdr[1].text = 'Bildname'
+            hdr[2].text = 'Typ'
+            hdr[3].text = 'Ähnlichkeit'
+            for cell in hdr:
+                set_cell_bg(cell, '1565C0')
+                for p in cell.paragraphs:
+                    for r in p.runs:
+                        r.font.bold = True
+                        r.font.color.rgb = CLR_WHITE
+                        r.font.size = Pt(9)
+
+            img_type_labels = {
+                'added': 'Hinzugefügt',
+                'removed': 'Entfernt',
+                'changed': 'Geändert',
+            }
+            img_type_colors = {
+                'added': ('E8F5E9', CLR_INS),
+                'removed': ('FFEBEE', CLR_DEL),
+                'changed': ('FFF8E1', RGBColor(0xE6, 0x5C, 0x00)),
+            }
+
+            for idx, ic in enumerate(changed_images[:100], 1):
+                row = img_table.add_row().cells
+                row[0].text = str(idx)
+                row[1].text = ic['name']
+                row[2].text = img_type_labels.get(ic['type'], ic['type'])
+                if ic['type'] == 'changed':
+                    row[3].text = f"{ic['similarity_pct']}%"
+                else:
+                    row[3].text = '—'
+
+                bg_hex, text_clr = img_type_colors.get(ic['type'], ('F5F5F5', CLR_GREY))
+                for cell in row:
+                    set_cell_bg(cell, bg_hex)
+                    for p in cell.paragraphs:
+                        for r in p.runs:
+                            r.font.size = Pt(8)
+                # Color the type column
+                for p in row[2].paragraphs:
+                    for r in p.runs:
+                        r.font.color.rgb = text_clr
+                        r.font.bold = True
+
+            # Set column widths for image table
+            for row in img_table.rows:
+                row.cells[0].width = Cm(1)
+                row.cells[1].width = Cm(6)
+                row.cells[2].width = Cm(3)
+                row.cells[3].width = Cm(3)
+
+    except Exception:
+        # Image comparison is best-effort; don't fail the report
+        pass
 
     report_path = os.path.join(tmpdir, 'report.docx')
     report.save(report_path)

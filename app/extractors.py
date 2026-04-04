@@ -317,9 +317,49 @@ def _extract_footnote_refs(para_element):
     return fn_refs, en_refs
 
 
+def _extract_para_images(para_element, doc_part):
+    """
+    Extract image references from a paragraph element.
+    Looks for w:drawing and w:pict elements that embed images via relationships.
+    Returns a list of image filenames referenced in this paragraph.
+    """
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+    import os
+
+    image_names = []
+
+    # Look for w:drawing > wp:inline or wp:anchor > a:graphic > a:graphicData > a:blip
+    for drawing in para_element.findall(f'.//{{{W}}}drawing'):
+        for blip in drawing.findall(f'.//{{{A}}}blip'):
+            embed_id = blip.get(f'{{{R}}}embed')
+            if embed_id and embed_id in doc_part.rels:
+                rel = doc_part.rels[embed_id]
+                if hasattr(rel, 'target_ref'):
+                    image_names.append(os.path.basename(rel.target_ref))
+                elif hasattr(rel, 'target_partname'):
+                    image_names.append(os.path.basename(str(rel.target_partname)))
+
+    # Look for w:pict > v:imagedata (older VML format)
+    VML = 'urn:schemas-microsoft-com:vml'
+    for pict in para_element.findall(f'.//{{{W}}}pict'):
+        for imagedata in pict.findall(f'.//{{{VML}}}imagedata'):
+            embed_id = imagedata.get(f'{{{R}}}id')
+            if embed_id and embed_id in doc_part.rels:
+                rel = doc_part.rels[embed_id]
+                if hasattr(rel, 'target_ref'):
+                    image_names.append(os.path.basename(rel.target_ref))
+                elif hasattr(rel, 'target_partname'):
+                    image_names.append(os.path.basename(str(rel.target_partname)))
+
+    return image_names
+
+
 def extract_docx(filepath):
     """Extract text with formatting, fields, numbering, cross-refs, TOC, comments,
-    footnotes, endnotes, XE/TA/TC index entries from DOCX files."""
+    footnotes, endnotes, XE/TA/TC index entries, and embedded images from DOCX files."""
     from docx import Document
     doc = Document(filepath)
     paragraphs = []
@@ -329,6 +369,9 @@ def extract_docx(filepath):
     all_comments = _extract_comments(doc.element)
     all_footnotes = _extract_footnotes(doc.element)
     all_endnotes = _extract_endnotes(doc.element)
+
+    # Get the document part for resolving image relationships
+    doc_part = doc.part
 
     def process_para(para, context=''):
         text = para.text
@@ -363,6 +406,9 @@ def extract_docx(filepath):
         for eid in en_refs:
             if eid in all_endnotes:
                 para_endnotes.append({'id': eid, 'text': all_endnotes[eid]})
+
+        # Extract embedded image references for this paragraph
+        para_image_names = _extract_para_images(para._element, doc_part)
 
         # Enrich text with field information for diff detection
         field_text_parts = []
@@ -466,13 +512,25 @@ def extract_docx(filepath):
             fn_html = ' ' + ' '.join(fn_tags)
 
         # Wrap html in alignment div if needed
-        full_html = f'{num_prefix}{html}{field_html}{comment_html}{fn_html}'
+        full_html = f'{num_prefix}{html}{field_html}{comment_html}{fn_html}{image_html}'
         if alignment and alignment != 'left':
             full_html = f'<div style="text-align:{alignment}">{full_html}</div>'
 
-        # Build enriched plain text for comparison (includes field info, comments, footnotes)
+        # Build image text markers for enriched text and HTML
+        image_text_parts = []
+        image_html = ''
+        for img_name in para_image_names:
+            image_text_parts.append(f'[Bild: {img_name}]')
+        if image_text_parts:
+            img_tags = ' '.join(
+                f'<span style="background:#fce4ec;color:#c62828;font-size:0.75em;padding:1px 4px;border-radius:3px;margin-left:2px">{escape(it)}</span>'
+                for it in image_text_parts
+            )
+            image_html = f' {img_tags}'
+
+        # Build enriched plain text for comparison (includes field info, comments, footnotes, images)
         enriched_text = text
-        all_extra = field_text_parts + comment_text_parts + fn_text_parts
+        all_extra = field_text_parts + comment_text_parts + fn_text_parts + image_text_parts
         if all_extra:
             enriched_text = text + ' ' + ' '.join(all_extra)
 
@@ -504,6 +562,7 @@ def extract_docx(filepath):
             'comments': para_comments,
             'footnotes': para_footnotes,
             'endnotes': para_endnotes,
+            'images': para_image_names,
         }
         paragraphs.append(entry)
         # Use enriched text for plain text so field/comment/footnote changes are detected
