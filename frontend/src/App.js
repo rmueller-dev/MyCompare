@@ -125,36 +125,6 @@ function DownloadButtons({ docId, versionA, versionB, fileType, latestVersionId 
           Als PDF
         </a>
 
-        {/* PDF/A */}
-        <a href={`${API}/redline/${docId}/${versionA}/${versionB}?format=pdfa`}
-          className={`${btnBase} bg-amber-600 hover:bg-amber-700 text-white`}
-          download>
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-          </svg>
-          PDF/A (Archiv)
-        </a>
-
-        {/* Changed pages/sections only - Word */}
-        <a href={`${API}/export-changed-pages-only/${docId}/${versionA}/${versionB}?format=original`}
-          className={`${btnBase} bg-orange-500 hover:bg-orange-600 text-white`}
-          download>
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-          </svg>
-          Nur Änderungen (Word)
-        </a>
-
-        {/* Changed pages/sections only - PDF */}
-        <a href={`${API}/export-changed-pages-only/${docId}/${versionA}/${versionB}?format=pdf`}
-          className={`${btnBase} bg-orange-600 hover:bg-orange-700 text-white`}
-          download>
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-          </svg>
-          Nur Änderungen (PDF)
-        </a>
-
         {/* Redline (all file types) */}
         <a href={`${API}/redline/${docId}/${versionA}/${versionB}`}
           className={`${btnBase} bg-purple-600 hover:bg-purple-700 text-white`}
@@ -186,6 +156,36 @@ function DownloadButtons({ docId, versionA, versionB, fileType, latestVersionId 
             Metadaten entfernen
           </a>
         )}
+
+        {/* Changed pages/sections only - Word (green) */}
+        <a href={`${API}/export-changed-pages-only/${docId}/${versionA}/${versionB}?format=original`}
+          className={`${btnBase} bg-green-600 hover:bg-green-700 text-white`}
+          download>
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+          </svg>
+          Nur Änderungen (Word)
+        </a>
+
+        {/* Changed pages/sections only - PDF (light green) */}
+        <a href={`${API}/export-changed-pages-only/${docId}/${versionA}/${versionB}?format=pdf`}
+          className={`${btnBase} bg-emerald-500 hover:bg-emerald-600 text-white`}
+          download>
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+          </svg>
+          Nur Änderungen (PDF)
+        </a>
+
+        {/* PDF/A (amber) */}
+        <a href={`${API}/redline/${docId}/${versionA}/${versionB}?format=pdfa`}
+          className={`${btnBase} bg-amber-600 hover:bg-amber-700 text-white`}
+          download>
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+          </svg>
+          PDF/A (Archiv)
+        </a>
       </div>
     </div>
   );
