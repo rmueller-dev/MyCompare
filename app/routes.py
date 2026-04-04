@@ -624,6 +624,71 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
         })
         return change_counter[0]
 
+    # ── Merge comments from doc_a into doc_b ──
+    # So deleted paragraphs' comments are preserved in the redline
+    def _merge_comments_from_a():
+        """Copy comments from doc_a into doc_b's comment part, remapping IDs."""
+        try:
+            comment_part_a = None
+            for rel in doc_a.element.part.rels.values():
+                if 'comments' in rel.reltype:
+                    comment_part_a = rel.target_part
+                    break
+            if comment_part_a is None:
+                return {}
+
+            comment_part_b = None
+            for rel in doc_b.element.part.rels.values():
+                if 'comments' in rel.reltype:
+                    comment_part_b = rel.target_part
+                    break
+
+            root_a = etree.fromstring(comment_part_a.blob)
+            comments_a = root_a.findall(f'{{{W}}}comment')
+            if not comments_a:
+                return {}
+
+            # Find max comment ID in B
+            max_id = 0
+            if comment_part_b is not None:
+                root_b = etree.fromstring(comment_part_b.blob)
+                for c in root_b.findall(f'{{{W}}}comment'):
+                    cid = int(c.get(f'{{{W}}}id', '0'))
+                    max_id = max(max_id, cid)
+
+            # Remap and copy comments from A
+            id_remap = {}
+            if comment_part_b is not None:
+                root_b = etree.fromstring(comment_part_b.blob)
+            else:
+                root_b = etree.Element(f'{{{W}}}comments')
+
+            for c in comments_a:
+                old_id = c.get(f'{{{W}}}id', '')
+                max_id += 1
+                new_id = str(max_id)
+                id_remap[old_id] = new_id
+                c.set(f'{{{W}}}id', new_id)
+                root_b.append(c)
+
+            if comment_part_b is not None:
+                comment_part_b._blob = etree.tostring(root_b, xml_declaration=True, encoding='UTF-8', standalone=True)
+            return id_remap
+        except Exception:
+            return {}
+
+    comment_id_remap = _merge_comments_from_a()
+
+    def remap_comment_ids_in_element(el):
+        """Remap comment IDs in paragraph elements copied from doc_a."""
+        if not comment_id_remap:
+            return
+        for tag_name in ('commentRangeStart', 'commentRangeEnd', 'commentReference'):
+            for node in el.findall(f'.//{{{W}}}{tag_name}'):
+                old_id = node.get(f'{{{W}}}id', '')
+                if old_id in comment_id_remap:
+                    node.set(f'{{{W}}}id', comment_id_remap[old_id])
+
     # ── Build redline body ──
     import shutil
     work_path = os.path.join(tmpdir, '_work.docx')
@@ -699,6 +764,37 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                         elif wtag == 'insert':
                             r_ins = make_run_element(''.join(words_b[wj1:wj2]), rpr_b)
                             p_el.append(wrap_in_ins(r_ins))
+
+                    # Carry over non-run elements and field-containing runs from both sources
+                    non_run_tags = ('fldSimple', 'commentRangeStart', 'commentRangeEnd',
+                                    'bookmarkStart', 'bookmarkEnd')
+                    if old_idx is not None:
+                        for child in doc_a.paragraphs[old_idx]._element:
+                            local = etree.QName(child.tag).localname if '}' in child.tag else child.tag
+                            if local in non_run_tags:
+                                copied = etree.fromstring(etree.tostring(child))
+                                remap_comment_ids_in_element(copied)
+                                p_el.append(copied)
+                            elif local == 'r':
+                                # Copy field-code runs (fldChar, instrText, footnoteRef, endnoteRef)
+                                has_field = child.find(f'{{{W}}}fldChar') is not None
+                                has_instr = child.find(f'{{{W}}}instrText') is not None
+                                has_fnref = child.find(f'{{{W}}}footnoteReference') is not None
+                                has_enref = child.find(f'{{{W}}}endnoteReference') is not None
+                                if has_field or has_instr or has_fnref or has_enref:
+                                    p_el.append(etree.fromstring(etree.tostring(child)))
+                    if new_idx is not None:
+                        for child in doc_b.paragraphs[new_idx]._element:
+                            local = etree.QName(child.tag).localname if '}' in child.tag else child.tag
+                            if local in non_run_tags:
+                                p_el.append(etree.fromstring(etree.tostring(child)))
+                            elif local == 'r':
+                                has_field = child.find(f'{{{W}}}fldChar') is not None
+                                has_instr = child.find(f'{{{W}}}instrText') is not None
+                                has_fnref = child.find(f'{{{W}}}footnoteReference') is not None
+                                has_enref = child.find(f'{{{W}}}endnoteReference') is not None
+                                if has_field or has_instr or has_fnref or has_enref:
+                                    p_el.append(etree.fromstring(etree.tostring(child)))
                 elif old_text:
                     cnum = record_change('Löschung', old_text, '', old_idx)
                     add_bookmark(p_el, cnum)
@@ -717,27 +813,21 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                 else:
                     cnum = record_change('Löschung', paras_a[idx], '', idx)
 
-                p_el = etree.SubElement(body, f'{{{W}}}p')
-                src_ppr = doc_a.paragraphs[idx]._element.find(f'{{{W}}}pPr')
-                if src_ppr is not None:
-                    p_el.append(etree.fromstring(etree.tostring(src_ppr)))
+                # Copy full paragraph from doc_a (preserves comment refs, footnote refs, field codes)
+                p_el = etree.fromstring(etree.tostring(doc_a.paragraphs[idx]._element))
+                remap_comment_ids_in_element(p_el)
+                # Wrap all runs in deletion marks (collect first, then replace)
+                runs_with_pos = []
+                for r_el in p_el.findall(f'{{{W}}}r'):
+                    parent = r_el.getparent()
+                    pos = list(parent).index(r_el)
+                    runs_with_pos.append((parent, pos, r_el))
+                for parent, pos, r_el in reversed(runs_with_pos):
+                    parent.remove(r_el)
+                    del_wrapper = wrap_in_del(r_el)
+                    parent.insert(pos, del_wrapper)
                 add_bookmark(p_el, cnum)
-
-                # Copy all runs from source with their formatting, wrapped in del
-                src_runs = doc_a.paragraphs[idx]._element.findall(f'{{{W}}}r')
-                if src_runs:
-                    for src_r in src_runs:
-                        r_copy = etree.fromstring(etree.tostring(src_r))
-                        p_el.append(wrap_in_del(r_copy))
-                else:
-                    rpr_src = doc_a.paragraphs[idx]._element.find(f'{{{W}}}r')
-                    rpr_xml = None
-                    if rpr_src is not None:
-                        rpr_el = rpr_src.find(f'{{{W}}}rPr')
-                        if rpr_el is not None:
-                            rpr_xml = etree.tostring(rpr_el)
-                    r_del = make_run_element(paras_a[idx] or '', rpr_xml)
-                    p_el.append(wrap_in_del(r_del))
+                body.append(p_el)
 
                 # Mark paragraph mark as deleted
                 ppr_del = p_el.find(f'{{{W}}}pPr')
@@ -756,21 +846,20 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                 else:
                     cnum = record_change('Einfügung', '', paras_b[idx], idx)
 
-                p_el = etree.SubElement(body, f'{{{W}}}p')
-                src_ppr = doc_b.paragraphs[idx]._element.find(f'{{{W}}}pPr')
-                if src_ppr is not None:
-                    p_el.append(etree.fromstring(etree.tostring(src_ppr)))
+                # Copy full paragraph from doc_b (preserves comment refs, footnote refs, field codes)
+                p_el = etree.fromstring(etree.tostring(doc_b.paragraphs[idx]._element))
+                # Wrap all runs in insertion marks (collect first, then replace)
+                runs_with_pos = []
+                for r_el in p_el.findall(f'{{{W}}}r'):
+                    parent = r_el.getparent()
+                    pos = list(parent).index(r_el)
+                    runs_with_pos.append((parent, pos, r_el))
+                for parent, pos, r_el in reversed(runs_with_pos):
+                    parent.remove(r_el)
+                    ins_wrapper = wrap_in_ins(r_el)
+                    parent.insert(pos, ins_wrapper)
                 add_bookmark(p_el, cnum)
-
-                # Copy all runs from source with their formatting, wrapped in ins
-                src_runs = doc_b.paragraphs[idx]._element.findall(f'{{{W}}}r')
-                if src_runs:
-                    for src_r in src_runs:
-                        r_copy = etree.fromstring(etree.tostring(src_r))
-                        p_el.append(wrap_in_ins(r_copy))
-                else:
-                    r_ins = make_run_element(paras_b[idx] or '')
-                    p_el.append(wrap_in_ins(r_ins))
+                body.append(p_el)
 
     out_path = os.path.join(tmpdir, 'redline.docx')
     out_doc.save(out_path)

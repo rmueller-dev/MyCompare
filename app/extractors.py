@@ -188,12 +188,147 @@ def _extract_bookmarks(para_element):
     return bookmarks
 
 
+def _extract_comments(doc_element):
+    """Extract all comments from the DOCX comments part."""
+    from lxml import etree
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    nsmap = {'w': W}
+    comments = {}
+
+    # Access the comments part via the package
+    try:
+        comment_part = None
+        for rel in doc_element.part.rels.values():
+            if 'comments' in rel.reltype:
+                comment_part = rel.target_part
+                break
+        if comment_part is None:
+            return comments
+
+        root = etree.fromstring(comment_part.blob)
+        for comment_el in root.findall(f'{{{W}}}comment'):
+            cid = comment_el.get(f'{{{W}}}id', '')
+            author = comment_el.get(f'{{{W}}}author', '')
+            date = comment_el.get(f'{{{W}}}date', '')
+            text_parts = []
+            for p in comment_el.findall(f'{{{W}}}p'):
+                for t in p.findall(f'.//{{{W}}}t'):
+                    if t.text:
+                        text_parts.append(t.text)
+            comments[cid] = {
+                'id': cid,
+                'author': author,
+                'date': date,
+                'text': ' '.join(text_parts),
+            }
+    except Exception:
+        pass
+    return comments
+
+
+def _extract_footnotes(doc_element):
+    """Extract all footnotes from the DOCX footnotes part."""
+    from lxml import etree
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    footnotes = {}
+    try:
+        fn_part = None
+        for rel in doc_element.part.rels.values():
+            if 'footnotes' in rel.reltype:
+                fn_part = rel.target_part
+                break
+        if fn_part is None:
+            return footnotes
+
+        root = etree.fromstring(fn_part.blob)
+        for fn_el in root.findall(f'{{{W}}}footnote'):
+            fid = fn_el.get(f'{{{W}}}id', '')
+            fn_type = fn_el.get(f'{{{W}}}type', '')
+            if fn_type in ('separator', 'continuationSeparator'):
+                continue
+            text_parts = []
+            for p in fn_el.findall(f'{{{W}}}p'):
+                for t in p.findall(f'.//{{{W}}}t'):
+                    if t.text:
+                        text_parts.append(t.text)
+            if text_parts:
+                footnotes[fid] = ' '.join(text_parts)
+    except Exception:
+        pass
+    return footnotes
+
+
+def _extract_endnotes(doc_element):
+    """Extract all endnotes from the DOCX endnotes part."""
+    from lxml import etree
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    endnotes = {}
+    try:
+        en_part = None
+        for rel in doc_element.part.rels.values():
+            if 'endnotes' in rel.reltype:
+                en_part = rel.target_part
+                break
+        if en_part is None:
+            return endnotes
+
+        root = etree.fromstring(en_part.blob)
+        for en_el in root.findall(f'{{{W}}}endnote'):
+            eid = en_el.get(f'{{{W}}}id', '')
+            en_type = en_el.get(f'{{{W}}}type', '')
+            if en_type in ('separator', 'continuationSeparator'):
+                continue
+            text_parts = []
+            for p in en_el.findall(f'{{{W}}}p'):
+                for t in p.findall(f'.//{{{W}}}t'):
+                    if t.text:
+                        text_parts.append(t.text)
+            if text_parts:
+                endnotes[eid] = ' '.join(text_parts)
+    except Exception:
+        pass
+    return endnotes
+
+
+def _extract_comment_refs(para_element):
+    """Extract comment reference IDs from a paragraph."""
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    refs = []
+    for cr in para_element.findall(f'.//{{{W}}}commentRangeStart'):
+        cid = cr.get(f'{{{W}}}id', '')
+        if cid:
+            refs.append(cid)
+    return refs
+
+
+def _extract_footnote_refs(para_element):
+    """Extract footnote/endnote reference IDs from a paragraph."""
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    fn_refs = []
+    en_refs = []
+    for ref in para_element.findall(f'.//{{{W}}}footnoteReference'):
+        fid = ref.get(f'{{{W}}}id', '')
+        if fid:
+            fn_refs.append(fid)
+    for ref in para_element.findall(f'.//{{{W}}}endnoteReference'):
+        eid = ref.get(f'{{{W}}}id', '')
+        if eid:
+            en_refs.append(eid)
+    return fn_refs, en_refs
+
+
 def extract_docx(filepath):
-    """Extract text with formatting, fields, numbering, cross-refs, TOC from DOCX files."""
+    """Extract text with formatting, fields, numbering, cross-refs, TOC, comments,
+    footnotes, endnotes, XE/TA/TC index entries from DOCX files."""
     from docx import Document
     doc = Document(filepath)
     paragraphs = []
     plain_parts = []
+
+    # Extract document-level comments, footnotes, endnotes
+    all_comments = _extract_comments(doc.element)
+    all_footnotes = _extract_footnotes(doc.element)
+    all_endnotes = _extract_endnotes(doc.element)
 
     def process_para(para, context=''):
         text = para.text
@@ -211,23 +346,83 @@ def extract_docx(filepath):
         # Extract bookmarks
         bookmarks = _extract_bookmarks(para._element)
 
+        # Extract comment references for this paragraph
+        comment_refs = _extract_comment_refs(para._element)
+        para_comments = []
+        for cid in comment_refs:
+            if cid in all_comments:
+                para_comments.append(all_comments[cid])
+
+        # Extract footnote/endnote references for this paragraph
+        fn_refs, en_refs = _extract_footnote_refs(para._element)
+        para_footnotes = []
+        for fid in fn_refs:
+            if fid in all_footnotes:
+                para_footnotes.append({'id': fid, 'text': all_footnotes[fid]})
+        para_endnotes = []
+        for eid in en_refs:
+            if eid in all_endnotes:
+                para_endnotes.append({'id': eid, 'text': all_endnotes[eid]})
+
         # Enrich text with field information for diff detection
         field_text_parts = []
         for f in fields:
             instr = f['instruction'].upper()
             display = f['display']
-            if 'REF' in instr:
-                field_text_parts.append(f'[Querverweis: {f["instruction"]} → "{display}"]')
+            if 'XE' in instr:
+                field_text_parts.append(f'[Index-Eintrag: {f["instruction"]}]')
+            elif 'TA' in instr:
+                field_text_parts.append(f'[Rechtsquellenverzeichnis: {f["instruction"]}]')
+            elif 'TC' in instr:
+                field_text_parts.append(f'[Verzeichniseintrag: {f["instruction"]}]')
             elif 'TOC' in instr:
-                field_text_parts.append(f'[Verzeichnis: {f["instruction"]}]')
+                field_text_parts.append(f'[Inhaltsverzeichnis: {f["instruction"]}]')
+            elif 'TOA' in instr:
+                field_text_parts.append(f'[Rechtsquellenverzeichnis: {f["instruction"]}]')
+            elif 'INDEX' in instr:
+                field_text_parts.append(f'[Stichwortverzeichnis: {f["instruction"]}]')
+            elif 'REF' in instr:
+                field_text_parts.append(f'[Querverweis: {f["instruction"]} → "{display}"]')
+            elif 'PAGEREF' in instr:
+                field_text_parts.append(f'[Seitenverweis: {f["instruction"]} → "{display}"]')
+            elif 'NOTEREF' in instr:
+                field_text_parts.append(f'[Fußnotenverweis: {f["instruction"]} → "{display}"]')
             elif 'PAGE' in instr:
                 field_text_parts.append(f'[Seitenzahl: {display}]')
             elif 'SEQ' in instr:
                 field_text_parts.append(f'[Nummerierung: {f["instruction"]} → "{display}"]')
             elif 'HYPERLINK' in instr:
                 field_text_parts.append(f'[Link: {f["instruction"]}]')
+            elif 'AUTOTEXT' in instr or 'AUTOTEXTLIST' in instr:
+                field_text_parts.append(f'[AutoText: {f["instruction"]}]')
+            elif 'CITATION' in instr or 'BIBLIOGRAPHY' in instr:
+                field_text_parts.append(f'[Zitat: {f["instruction"]}]')
+            elif 'IF' in instr:
+                field_text_parts.append(f'[Bedingungsfeld: {f["instruction"]}]')
+            elif 'MERGEFIELD' in instr:
+                field_text_parts.append(f'[Seriendruckfeld: {f["instruction"]}]')
+            elif 'DOCPROPERTY' in instr or 'INFO' in instr:
+                field_text_parts.append(f'[Dokumenteigenschaft: {f["instruction"]}]')
+            elif 'DATE' in instr or 'TIME' in instr:
+                field_text_parts.append(f'[Datum/Zeit: {f["instruction"]} → "{display}"]')
+            elif 'NUMPAGES' in instr or 'SECTIONPAGES' in instr:
+                field_text_parts.append(f'[Seitenanzahl: {display}]')
+            elif 'STYLEREF' in instr:
+                field_text_parts.append(f'[Formatvorlagenverweis: {f["instruction"]} → "{display}"]')
             else:
                 field_text_parts.append(f'[Feld: {f["instruction"]} → "{display}"]')
+
+        # Add comment text to enriched text for diff
+        comment_text_parts = []
+        for c in para_comments:
+            comment_text_parts.append(f'[Kommentar ({c["author"]}): {c["text"]}]')
+
+        # Add footnote/endnote text
+        fn_text_parts = []
+        for fn in para_footnotes:
+            fn_text_parts.append(f'[Fußnote {fn["id"]}: {fn["text"]}]')
+        for en in para_endnotes:
+            fn_text_parts.append(f'[Endnote {en["id"]}: {en["text"]}]')
 
         # Add numbering prefix to HTML for visual display
         num_prefix = ''
@@ -236,22 +431,50 @@ def extract_docx(filepath):
 
         # Add field annotations to HTML
         field_html = ''
-        if fields:
+        all_annotations = field_text_parts + comment_text_parts + fn_text_parts
+        if all_annotations:
             field_tags = ' '.join(
                 f'<span style="background:#e0e7ff;color:#3730a3;font-size:0.75em;padding:1px 4px;border-radius:3px;margin-left:2px">{escape(ft)}</span>'
-                for ft in field_text_parts
+                for ft in all_annotations
             )
             field_html = f' {field_tags}'
 
+        # Add comment bubbles to HTML
+        comment_html = ''
+        if para_comments:
+            comment_tags = ' '.join(
+                f'<span style="background:#fef3c7;color:#92400e;font-size:0.75em;padding:2px 6px;border-radius:3px;border:1px solid #f59e0b;margin-left:4px" title="{escape(c["text"])}">'
+                f'💬 {escape(c["author"])}: {escape(c["text"][:60])}</span>'
+                for c in para_comments
+            )
+            comment_html = f' {comment_tags}'
+
+        # Add footnote/endnote markers to HTML
+        fn_html = ''
+        if para_footnotes or para_endnotes:
+            fn_tags = []
+            for fn in para_footnotes:
+                fn_tags.append(
+                    f'<span style="background:#dbeafe;color:#1e40af;font-size:0.75em;padding:2px 6px;border-radius:3px;border:1px solid #3b82f6;margin-left:4px"'
+                    f' title="{escape(fn["text"])}">Fn{fn["id"]}</span>'
+                )
+            for en in para_endnotes:
+                fn_tags.append(
+                    f'<span style="background:#ede9fe;color:#5b21b6;font-size:0.75em;padding:2px 6px;border-radius:3px;border:1px solid #7c3aed;margin-left:4px"'
+                    f' title="{escape(en["text"])}">En{en["id"]}</span>'
+                )
+            fn_html = ' ' + ' '.join(fn_tags)
+
         # Wrap html in alignment div if needed
-        full_html = f'{num_prefix}{html}{field_html}'
+        full_html = f'{num_prefix}{html}{field_html}{comment_html}{fn_html}'
         if alignment and alignment != 'left':
             full_html = f'<div style="text-align:{alignment}">{full_html}</div>'
 
-        # Build enriched plain text for comparison (includes field info)
+        # Build enriched plain text for comparison (includes field info, comments, footnotes)
         enriched_text = text
-        if field_text_parts:
-            enriched_text = text + ' ' + ' '.join(field_text_parts)
+        all_extra = field_text_parts + comment_text_parts + fn_text_parts
+        if all_extra:
+            enriched_text = text + ' ' + ' '.join(all_extra)
 
         entry = {
             'index': len(paragraphs),
@@ -265,9 +488,12 @@ def extract_docx(filepath):
             'fields': fields,
             'numbering': numbering,
             'bookmarks': bookmarks,
+            'comments': para_comments,
+            'footnotes': para_footnotes,
+            'endnotes': para_endnotes,
         }
         paragraphs.append(entry)
-        # Use enriched text for plain text so field changes are detected by Engine B
+        # Use enriched text for plain text so field/comment/footnote changes are detected
         plain_parts.append(enriched_text)
 
     for para in doc.paragraphs:
@@ -288,6 +514,12 @@ def extract_docx(filepath):
                 for para in hf.paragraphs:
                     if para.text.strip():
                         process_para(para, hf_name)
+
+    # Add standalone footnotes/endnotes that aren't referenced in body
+    for fid, fn_text in all_footnotes.items():
+        plain_parts.append(f'[Fußnote {fid}: {fn_text}]')
+    for eid, en_text in all_endnotes.items():
+        plain_parts.append(f'[Endnote {eid}: {en_text}]')
 
     plain_text = '\n'.join(plain_parts)
     return paragraphs, plain_text
