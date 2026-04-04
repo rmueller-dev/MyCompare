@@ -66,9 +66,10 @@ echo ""
     fi
 }) &
 
-# Run Flask on detected port
-python -c "
-from app.main import create_app
-app = create_app()
-app.run(debug=False, port=$PORT, host='127.0.0.1')
-"
+# Run with gunicorn (production WSGI server)
+gunicorn \
+    --bind "127.0.0.1:$PORT" \
+    --workers 2 \
+    --timeout 120 \
+    --access-logfile - \
+    "app.main:create_app()"
