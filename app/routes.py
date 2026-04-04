@@ -965,10 +965,12 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
     CLR_TITLE = RGBColor(0x1F, 0x38, 0x64)
     CLR_GREY = RGBColor(0x66, 0x66, 0x66)
     CLR_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+    CLR_FMT = RGBColor(0xE6, 0x51, 0x00)    # orange for formatting changes
 
     type_bg_colors = {
         'Einfügung': 'E8F5E9', 'Löschung': 'FFEBEE', 'Ersetzung': 'FFF8E1',
         'Verschoben (Quelle)': 'F3E5F5', 'Verschoben (Ziel)': 'F3E5F5',
+        'Formatierung': 'FFF3E0',
     }
 
     def set_cell_bg(cell, hex_color):
@@ -1036,6 +1038,20 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
                 tag_run.font.size = Pt(7)
                 tag_run.font.color.rgb = CLR_MOVE
                 tag_run.font.italic = True
+        elif ctype == 'Formatierung':
+            # Show the text context in normal style
+            text_preview = (old or new or '')[:120]
+            if text_preview:
+                run = paragraph.add_run(text_preview)
+                run.font.size = Pt(8)
+                run.font.color.rgb = CLR_GREY
+            # Show the formatting change description in orange
+            # The 'new' field contains the description of what changed
+            if new and new != text_preview:
+                desc_run = paragraph.add_run(f'\n{new}')
+                desc_run.font.size = Pt(7)
+                desc_run.font.color.rgb = CLR_FMT
+                desc_run.font.italic = True
         else:
             run = paragraph.add_run(old or new or '—')
             run.font.size = Pt(8)
@@ -1082,6 +1098,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
         ('Gelöscht', 'Text der aus der alten Version entfernt wurde', CLR_DEL, True, False),
         ('Ersetzung', 'Gelöschter Text (rot) gefolgt von neuem Text (blau)', CLR_GREY, False, False),
         ('Verschoben', 'Text der an eine andere Stelle verschoben wurde', CLR_MOVE, False, False),
+        ('Formatierung', 'Gleicher Text, aber Formatierung geändert (z.B. Fett, Schriftgröße)', CLR_FMT, False, False),
     ]
     for label, desc, color, strike, underline in legend_items:
         p = report.add_paragraph()
@@ -1176,6 +1193,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
             'Einfügung': CLR_INS, 'Löschung': CLR_DEL,
             'Ersetzung': CLR_GREY,
             'Verschoben (Quelle)': CLR_MOVE, 'Verschoben (Ziel)': CLR_MOVE,
+            'Formatierung': CLR_FMT, 'Tabellenänderung': CLR_TBL,
         }.get(change['type'], CLR_GREY)
         for p in row[1].paragraphs:
             for r in p.runs:
@@ -2334,4 +2352,316 @@ def _text_to_pdf(text, tmpdir, title='Dokument'):
         story.append(Paragraph(safe, body_style))
 
     doc.build(story)
+    return out_path
+# P2.12 – Export only changed pages/sections
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _find_changed_pages_pdf(filepath_a, filepath_b):
+    """
+    Extract text per page from both PDFs and return a list of 1-based page
+    numbers (from version B) that have differences.
+    """
+    import pdfplumber
+
+    def pdf_pages_text(path):
+        pages = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                pages.append(page.extract_text() or '')
+        return pages
+
+    pages_a = pdf_pages_text(filepath_a)
+    pages_b = pdf_pages_text(filepath_b)
+
+    changed = []
+    max_pages = max(len(pages_a), len(pages_b))
+    for i in range(max_pages):
+        text_a = pages_a[i] if i < len(pages_a) else ''
+        text_b = pages_b[i] if i < len(pages_b) else ''
+        if text_a != text_b:
+            changed.append(i + 1)
+
+    return changed, len(pages_b)
+
+
+@api.route('/export-changed-pages-only/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
+def export_changed_pages_only(doc_id, version_a, version_b):
+    """
+    Export only the pages/sections that contain changes between two versions.
+    Query param: format=pdf|original (default: original)
+    - PDF files: extract only changed pages into a new PDF
+    - DOCX files: extract only changed paragraphs (with 1 paragraph context)
+    - XLSX files: export only sheets that have changes
+    """
+    import tempfile
+    import shutil
+
+    output_format = request.args.get('format', 'original')
+    if output_format not in ('original', 'pdf'):
+        return jsonify({'error': 'Format muss "original" oder "pdf" sein'}), 400
+
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        if not doc:
+            return jsonify({'error': 'Dokument nicht gefunden'}), 404
+
+        ver_a = session.query(Version).filter_by(
+            document_id=doc_id, version_number=version_a).first()
+        ver_b = session.query(Version).filter_by(
+            document_id=doc_id, version_number=version_b).first()
+        if not ver_a or not ver_b:
+            return jsonify({'error': 'Version nicht gefunden'}), 404
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            out_path = None
+
+            if doc.file_type == 'pdf':
+                out_path = _export_changed_pages_pdf(
+                    ver_a.filepath, ver_b.filepath, tmpdir, output_format)
+
+            elif doc.file_type == 'docx':
+                out_path = _export_changed_paragraphs_docx(
+                    ver_a.filepath, ver_b.filepath, tmpdir, output_format)
+
+            elif doc.file_type == 'xlsx':
+                out_path = _export_changed_sheets_xlsx(
+                    ver_a.filepath, ver_b.filepath, tmpdir, output_format)
+
+            else:
+                return jsonify({
+                    'error': 'Export nur geänderter Seiten wird für diesen '
+                             'Dateityp nicht unterstützt'
+                }), 400
+
+            if not out_path or not os.path.exists(out_path):
+                return jsonify({
+                    'error': 'Keine Änderungen gefunden oder Export fehlgeschlagen'
+                }), 404
+
+            ext = os.path.splitext(out_path)[1]
+            dl_name = (f"{doc.name}_NurAenderungen"
+                       f"_V{version_a}_vs_V{version_b}{ext}")
+            return send_from_directory(
+                os.path.dirname(out_path),
+                os.path.basename(out_path),
+                as_attachment=True,
+                download_name=dl_name,
+            )
+        finally:
+            import threading
+
+            def cleanup():
+                import time
+                time.sleep(10)
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            threading.Thread(target=cleanup, daemon=True).start()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+def _export_changed_pages_pdf(filepath_a, filepath_b, tmpdir, output_format):
+    """Extract only changed pages from a PDF into a new PDF."""
+    from PyPDF2 import PdfReader, PdfWriter
+
+    changed_pages, total_pages = _find_changed_pages_pdf(filepath_a, filepath_b)
+    if not changed_pages:
+        return None
+
+    reader_b = PdfReader(filepath_b)
+    writer = PdfWriter()
+
+    for page_num in changed_pages:
+        idx = page_num - 1
+        if idx < len(reader_b.pages):
+            writer.add_page(reader_b.pages[idx])
+
+    out_path = os.path.join(tmpdir, 'changed_pages.pdf')
+    with open(out_path, 'wb') as f:
+        writer.write(f)
+    return out_path
+
+
+def _export_changed_paragraphs_docx(filepath_a, filepath_b, tmpdir,
+                                     output_format):
+    """
+    Generate a DOCX redline, then extract only paragraphs that contain
+    tracked changes (w:ins or w:del elements), with 1 paragraph of context
+    before and after each changed paragraph.
+    """
+    from docx import Document as DocxDocument
+    from lxml import etree
+    import copy
+
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    # First generate the full redline
+    redline_path = _generate_docx_redline(filepath_a, filepath_b, tmpdir)
+
+    # Open the redline and find paragraphs with changes
+    redline_doc = DocxDocument(redline_path)
+    body = redline_doc.element.body
+    all_paras = list(body.iterchildren(f'{{{W}}}p'))
+    total = len(all_paras)
+
+    # Find indices of paragraphs that contain w:ins or w:del
+    changed_indices = set()
+    for i, para in enumerate(all_paras):
+        if (para.findall(f'.//{{{W}}}ins')
+                or para.findall(f'.//{{{W}}}del')):
+            changed_indices.add(i)
+
+    if not changed_indices:
+        return None
+
+    # Add context: 1 paragraph before and after each changed paragraph
+    with_context = set()
+    for idx in changed_indices:
+        with_context.add(idx)
+        if idx > 0:
+            with_context.add(idx - 1)
+        if idx < total - 1:
+            with_context.add(idx + 1)
+
+    # Build new document with only the selected paragraphs
+    out_doc = DocxDocument()
+    try:
+        out_doc.element.body.clear()
+    except Exception:
+        pass
+
+    sorted_indices = sorted(with_context)
+    prev_idx = -2
+
+    for idx in sorted_indices:
+        # Insert visual separator when there is a gap
+        if idx > prev_idx + 1 and prev_idx >= 0:
+            sep_para = etree.SubElement(out_doc.element.body, f'{{{W}}}p')
+            sep_run = etree.SubElement(sep_para, f'{{{W}}}r')
+            sep_rpr = etree.SubElement(sep_run, f'{{{W}}}rPr')
+            sep_color = etree.SubElement(sep_rpr, f'{{{W}}}color')
+            sep_color.set(f'{{{W}}}val', '999999')
+            sep_t = etree.SubElement(sep_run, f'{{{W}}}t')
+            sep_t.text = '\u2014 [...] \u2014'
+
+        new_para = copy.deepcopy(all_paras[idx])
+        out_doc.element.body.append(new_para)
+        prev_idx = idx
+
+    out_path = os.path.join(tmpdir, 'changed_paragraphs.docx')
+    out_doc.save(out_path)
+
+    if output_format == 'pdf':
+        pdf_path = _convert_docx_to_pdf(out_path, tmpdir)
+        if pdf_path:
+            return pdf_path
+
+    return out_path
+
+
+def _convert_docx_to_pdf(docx_path, tmpdir):
+    """Try to convert a DOCX to PDF using LibreOffice, return path or None."""
+    import subprocess
+    try:
+        subprocess.run(
+            ['libreoffice', '--headless', '--convert-to', 'pdf',
+             '--outdir', tmpdir, docx_path],
+            capture_output=True, timeout=60,
+        )
+        base = os.path.splitext(os.path.basename(docx_path))[0]
+        pdf_path = os.path.join(tmpdir, f'{base}.pdf')
+        if os.path.exists(pdf_path):
+            return pdf_path
+    except Exception:
+        pass
+    return None
+
+
+def _export_changed_sheets_xlsx(filepath_a, filepath_b, tmpdir,
+                                 output_format):
+    """Export only sheets that have changes between two XLSX files."""
+    from openpyxl import load_workbook, Workbook
+    import copy as copy_mod
+
+    wb_a = load_workbook(filepath_a, data_only=True)
+    wb_b = load_workbook(filepath_b, data_only=True)
+
+    sheets_a = {ws.title: ws for ws in wb_a.worksheets}
+    sheets_b = {ws.title: ws for ws in wb_b.worksheets}
+
+    changed_sheets = []
+
+    for name, ws_b in sheets_b.items():
+        ws_a = sheets_a.get(name)
+        if ws_a is None:
+            changed_sheets.append(name)
+            continue
+        # Compare cell values
+        has_diff = False
+        max_row = max(ws_a.max_row or 1, ws_b.max_row or 1)
+        max_col = max(ws_a.max_column or 1, ws_b.max_column or 1)
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                if (ws_a.cell(row=row, column=col).value
+                        != ws_b.cell(row=row, column=col).value):
+                    has_diff = True
+                    break
+            if has_diff:
+                break
+        if has_diff:
+            changed_sheets.append(name)
+
+    # Deleted sheets
+    for name in sheets_a:
+        if name not in sheets_b:
+            changed_sheets.append(f'{name} (gelöscht)')
+
+    if not changed_sheets:
+        return None
+
+    out_wb = Workbook()
+    default_sheet = out_wb.active
+    first = True
+
+    for name in changed_sheets:
+        if name.endswith(' (gelöscht)'):
+            ws_out = out_wb.create_sheet(title=name[:31])
+            ws_out.cell(row=1, column=1,
+                        value='Dieses Blatt wurde in der neuen Version gelöscht.')
+            if first:
+                out_wb.remove(default_sheet)
+                first = False
+            continue
+
+        ws_b = sheets_b[name]
+        ws_out = out_wb.create_sheet(title=name[:31])
+        if first:
+            out_wb.remove(default_sheet)
+            first = False
+
+        for row in ws_b.iter_rows():
+            for cell in row:
+                new_cell = ws_out.cell(
+                    row=cell.row, column=cell.column, value=cell.value)
+                if cell.has_style:
+                    new_cell.font = copy_mod.copy(cell.font)
+                    new_cell.fill = copy_mod.copy(cell.fill)
+                    new_cell.border = copy_mod.copy(cell.border)
+                    new_cell.number_format = cell.number_format
+                    new_cell.alignment = copy_mod.copy(cell.alignment)
+
+    out_path = os.path.join(tmpdir, 'changed_sheets.xlsx')
+    out_wb.save(out_path)
+
+    if output_format == 'pdf':
+        pdf_path = _convert_docx_to_pdf(out_path, tmpdir)
+        if pdf_path:
+            return pdf_path
+
     return out_path
