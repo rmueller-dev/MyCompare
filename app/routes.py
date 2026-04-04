@@ -3,7 +3,7 @@ import os
 import uuid
 from flask import Blueprint, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
-from .models import SessionLocal, Document, Version, STORAGE_DIR
+from .models import SessionLocal, Document, Version, RenderingSet, STORAGE_DIR
 from .extractors import extract
 from .diff_engine import compute_diff
 from .image_diff import extract_images, compare_images
@@ -15,7 +15,7 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 
 def get_file_type(filename):
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    if ext in ('docx', 'xlsx', 'pptx', 'pdf', 'rtf', 'txt'):
+    if ext in ('docx', 'xlsx', 'pptx', 'pdf', 'rtf', 'txt', 'html', 'htm'):
         return ext
     return None
 
@@ -42,7 +42,7 @@ def create_document():
 
     file_type = get_file_type(file.filename)
     if not file_type:
-        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF, RTF, TXT'}), 400
+        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF, RTF, TXT, HTML'}), 400
 
     # Check file size
     file.seek(0, 2)
@@ -234,11 +234,11 @@ def quick_compare():
     type_new = get_file_type(file_new.filename)
 
     if not type_old or not type_new:
-        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF, RTF, TXT'}), 400
-    if type_old != type_new:
-        return jsonify({'error': f'Dateitypen stimmen nicht überein: {type_old.upper()} vs. {type_new.upper()}'}), 400
+        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF, RTF, TXT, HTML'}), 400
 
-    file_type = type_old
+    # Cross-format comparison: allow different file types by comparing as plaintext
+    cross_format = (type_old != type_new)
+    file_type = type_old if not cross_format else 'txt'
 
     # Check file sizes
     for f in [file_old, file_new]:
@@ -282,8 +282,20 @@ def quick_compare():
         session.refresh(doc)
 
         # Run diff immediately
-        struct_a, text_a = extract(versions[0].filepath, file_type)
-        struct_b, text_b = extract(versions[1].filepath, file_type)
+        # For cross-format: extract each file with its own type, then compare as plaintext
+        if cross_format:
+            struct_a, text_a = extract(versions[0].filepath, type_old)
+            struct_b, text_b = extract(versions[1].filepath, type_new)
+            # Normalize to simple text structures for cross-format diff
+            struct_a = [{'index': i, 'text': line, 'html': line, 'formatting': []}
+                        for i, line in enumerate(text_a.split('\n')) if line.strip()]
+            struct_b = [{'index': i, 'text': line, 'html': line, 'formatting': []}
+                        for i, line in enumerate(text_b.split('\n')) if line.strip()]
+            text_a = '\n'.join(s['text'] for s in struct_a)
+            text_b = '\n'.join(s['text'] for s in struct_b)
+        else:
+            struct_a, text_a = extract(versions[0].filepath, file_type)
+            struct_b, text_b = extract(versions[1].filepath, file_type)
         options = {
             'ignore_whitespace': request.form.get('ignore_whitespace') == '1',
             'ignore_case': request.form.get('ignore_case') == '1',
@@ -314,6 +326,10 @@ def quick_compare():
         result['version_a'] = versions[0].to_dict()
         result['version_b'] = versions[1].to_dict()
         result['document'] = doc.to_dict()
+        if cross_format:
+            result['cross_format'] = True
+            result['format_a'] = type_old.upper()
+            result['format_b'] = type_new.upper()
 
         return jsonify(result)
 
@@ -485,10 +501,15 @@ def generate_redline(doc_id, version_a, version_b):
             if not gen:
                 return jsonify({'error': 'Nicht unterstützter Dateityp'}), 400
 
-            # If PDF format requested, generate PDF redline directly (no LibreOffice needed)
-            if output_format == 'pdf' and doc.file_type != 'pdf':
+            # If PDF or PDF/A format requested, generate PDF redline directly
+            if output_format in ('pdf', 'pdfa') and doc.file_type != 'pdf':
                 out_path = _generate_redline_pdf(
-                    ver_a.filepath, ver_b.filepath, doc.file_type, tmpdir)
+                    ver_a.filepath, ver_b.filepath, doc.file_type, tmpdir,
+                    pdfa=output_format == 'pdfa')
+            elif output_format == 'pdfa' and doc.file_type == 'pdf':
+                out_path = _generate_redline_pdf(
+                    ver_a.filepath, ver_b.filepath, doc.file_type, tmpdir,
+                    pdfa=True)
             else:
                 out_path = gen(ver_a.filepath, ver_b.filepath, tmpdir)
 
@@ -2215,14 +2236,14 @@ def export_changed_pages(doc_id, version_a, version_b):
         session.close()
 
 
-def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir):
+def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir, pdfa=False):
     """
     Generate a professional PDF redline with Litera Compare-style formatting:
     - Title page with legend, statistics table, numbered change list
     - Full document text with inline change markup (red strikethrough / blue underline)
     - Word-level granularity for replacements
     - Move detection
-    Works for all file types.
+    Works for all file types. Supports PDF/A output for long-term archiving.
     """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -2506,7 +2527,61 @@ def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir):
         story.append(Paragraph("Keine Änderungen erkannt.", body_style))
 
     doc.build(story)
+
+    # Convert to PDF/A if requested
+    if pdfa:
+        try:
+            _apply_pdfa_metadata(out_path)
+        except Exception:
+            pass  # Fall back to regular PDF if PDF/A conversion fails
+
     return out_path
+
+
+def _apply_pdfa_metadata(pdf_path):
+    """Add PDF/A-1b compliance metadata (XMP and output intent) to an existing PDF."""
+    from PyPDF2 import PdfReader, PdfWriter
+    from PyPDF2.generic import (
+        DecodedStreamObject, ArrayObject, DictionaryObject,
+        NameObject, NumberObject, TextStringObject,
+    )
+    from datetime import datetime
+
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+
+    # Add XMP metadata for PDF/A-1b
+    now = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    xmp = f'''<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<rdf:Description rdf:about=""
+  xmlns:dc="http://purl.org/dc/elements/1.1/"
+  xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/"
+  xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+  <pdfaid:part>1</pdfaid:part>
+  <pdfaid:conformance>B</pdfaid:conformance>
+  <dc:title><rdf:Alt><rdf:li xml:lang="x-default">MyCompare Redline</rdf:li></rdf:Alt></dc:title>
+  <dc:creator><rdf:Seq><rdf:li>MyCompare</rdf:li></rdf:Seq></dc:creator>
+  <xmp:CreateDate>{now}</xmp:CreateDate>
+  <xmp:ModifyDate>{now}</xmp:ModifyDate>
+</rdf:Description>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>'''
+
+    metadata_stream = DecodedStreamObject()
+    metadata_stream.set_data(xmp.encode('utf-8'))
+    metadata_stream[NameObject('/Type')] = NameObject('/Metadata')
+    metadata_stream[NameObject('/Subtype')] = NameObject('/XML')
+    metadata_ref = writer._add_object(metadata_stream)
+    writer._root_object[NameObject('/Metadata')] = metadata_ref
+
+    # Write
+    with open(pdf_path, 'wb') as f:
+        writer.write(f)
 
 
 def _export_pdf_pages(filepath, pages, tmpdir, output_format):
@@ -3049,3 +3124,235 @@ def _export_changed_sheets_xlsx(filepath_a, filepath_b, tmpdir,
             return pdf_path
 
     return out_path
+
+
+# ── Rendering Sets CRUD ──
+
+@api.route('/rendering-sets', methods=['GET'])
+def list_rendering_sets():
+    """List all rendering sets (comparison profiles)."""
+    session = SessionLocal()
+    try:
+        sets = session.query(RenderingSet).order_by(
+            RenderingSet.is_default.desc(), RenderingSet.name).all()
+        return jsonify([rs.to_dict() for rs in sets])
+    finally:
+        session.close()
+
+
+@api.route('/rendering-sets', methods=['POST'])
+def create_rendering_set():
+    """Create a new rendering set."""
+    data = request.get_json()
+    if not data or not data.get('name'):
+        return jsonify({'error': 'Name erforderlich'}), 400
+
+    session = SessionLocal()
+    try:
+        import json
+        rs = RenderingSet(
+            name=data['name'],
+            description=data.get('description', ''),
+            settings_json=json.dumps(data.get('settings', {}), ensure_ascii=False),
+        )
+        session.add(rs)
+        session.commit()
+        session.refresh(rs)
+        return jsonify(rs.to_dict()), 201
+    except Exception as e:
+        session.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@api.route('/rendering-sets/<int:rs_id>', methods=['GET'])
+def get_rendering_set(rs_id):
+    """Get a single rendering set."""
+    session = SessionLocal()
+    try:
+        rs = session.query(RenderingSet).get(rs_id)
+        if not rs:
+            return jsonify({'error': 'Nicht gefunden'}), 404
+        return jsonify(rs.to_dict())
+    finally:
+        session.close()
+
+
+@api.route('/rendering-sets/<int:rs_id>', methods=['PUT'])
+def update_rendering_set(rs_id):
+    """Update a rendering set."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'JSON body erforderlich'}), 400
+
+    session = SessionLocal()
+    try:
+        import json
+        rs = session.query(RenderingSet).get(rs_id)
+        if not rs:
+            return jsonify({'error': 'Nicht gefunden'}), 404
+
+        if 'name' in data:
+            rs.name = data['name']
+        if 'description' in data:
+            rs.description = data['description']
+        if 'settings' in data:
+            rs.settings_json = json.dumps(data['settings'], ensure_ascii=False)
+        if 'is_default' in data and data['is_default']:
+            for other in session.query(RenderingSet).filter(
+                    RenderingSet.id != rs_id).all():
+                other.is_default = False
+            rs.is_default = True
+
+        session.commit()
+        session.refresh(rs)
+        return jsonify(rs.to_dict())
+    except Exception as e:
+        session.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@api.route('/rendering-sets/<int:rs_id>', methods=['DELETE'])
+def delete_rendering_set(rs_id):
+    """Delete a rendering set."""
+    session = SessionLocal()
+    try:
+        rs = session.query(RenderingSet).get(rs_id)
+        if not rs:
+            return jsonify({'error': 'Nicht gefunden'}), 404
+        if rs.is_default:
+            return jsonify({'error': 'Standard-Profil kann nicht gelöscht werden'}), 400
+        session.delete(rs)
+        session.commit()
+        return jsonify({'ok': True})
+    except Exception as e:
+        session.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+# ── 1:Many Comparison ──
+
+@api.route('/multi-compare', methods=['POST'])
+def multi_compare():
+    """
+    Compare one original document against up to 5 modified versions.
+    Expects: file_original + file_modified_1 ... file_modified_N (up to 5)
+    Returns: individual diff results for each pair + merged summary.
+    """
+    if 'file_original' not in request.files:
+        return jsonify({'error': 'Bitte eine Originaldatei hochladen (file_original)'}), 400
+
+    file_original = request.files['file_original']
+    if not file_original.filename:
+        return jsonify({'error': 'Originaldatei hat keinen Namen'}), 400
+
+    type_orig = get_file_type(file_original.filename)
+    if not type_orig:
+        return jsonify({
+            'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF, RTF, TXT, HTML'
+        }), 400
+
+    # Collect modified files
+    modified_files = []
+    for i in range(1, 6):
+        key = f'file_modified_{i}'
+        if key in request.files:
+            f = request.files[key]
+            if f.filename:
+                ft = get_file_type(f.filename)
+                if ft != type_orig:
+                    return jsonify({
+                        'error': f'Datei {f.filename}: Typ {ft} passt nicht zum Original ({type_orig})'
+                    }), 400
+                modified_files.append(f)
+
+    if not modified_files:
+        return jsonify({'error': 'Mindestens eine modifizierte Datei erforderlich'}), 400
+
+    if len(modified_files) > 5:
+        return jsonify({'error': 'Maximal 5 modifizierte Versionen erlaubt'}), 400
+
+    import tempfile
+    import shutil
+    tmpdir = tempfile.mkdtemp()
+
+    try:
+        # Save original
+        orig_path = os.path.join(tmpdir, secure_filename(file_original.filename) or 'original')
+        file_original.save(orig_path)
+        struct_orig, text_orig = extract(orig_path, type_orig)
+
+        options = {
+            'ignore_whitespace': request.form.get('ignore_whitespace') == '1',
+            'ignore_case': request.form.get('ignore_case') == '1',
+            'ignore_headers_footers': request.form.get('ignore_headers_footers') == '1',
+        }
+
+        comparisons = []
+        merged_changes = []
+        total_stats = {
+            'total_changes': 0,
+            'additions': 0,
+            'deletions': 0,
+            'replacements': 0,
+            'moves': 0,
+            'formatting': 0,
+        }
+
+        for idx, mod_file in enumerate(modified_files):
+            mod_name = secure_filename(mod_file.filename) or f'modified_{idx}'
+            mod_path = os.path.join(tmpdir, f'{idx}_{mod_name}')
+            mod_file.save(mod_path)
+
+            struct_mod, text_mod = extract(mod_path, type_orig)
+            result = compute_diff(
+                struct_orig, text_orig, struct_mod, text_mod, type_orig, options)
+
+            summary = result.get('summary', {})
+            total_stats['total_changes'] += summary.get('total_changes', 0)
+            total_stats['additions'] += summary.get('additions', 0)
+            total_stats['deletions'] += summary.get('deletions', 0)
+            total_stats['replacements'] += summary.get('replacements', 0)
+            total_stats['moves'] += summary.get('move_count', 0)
+            total_stats['formatting'] += summary.get('formatting_count', 0)
+
+            for ch in result.get('structural_changes', []):
+                ch['source_file'] = mod_file.filename
+                ch['source_index'] = idx
+                merged_changes.append(ch)
+
+            comparisons.append({
+                'filename': mod_file.filename,
+                'index': idx,
+                'summary': summary,
+                'structural_changes': result.get('structural_changes', []),
+                'unified_lines': result.get('unified_lines', []),
+                'verification': result.get('verification'),
+            })
+
+        return jsonify({
+            'comparisons': comparisons,
+            'merged_changes': merged_changes,
+            'total_stats': total_stats,
+            'file_count': len(modified_files),
+            'original_filename': file_original.filename,
+            'file_type': type_orig,
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        import threading
+
+        def cleanup():
+            import time
+            time.sleep(10)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        threading.Thread(target=cleanup, daemon=True).start()

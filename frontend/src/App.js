@@ -7,6 +7,8 @@ import CompareSettings from './CompareSettings';
 import ColorConfig from './ColorConfig';
 import ThreePaneDiff from './ThreePaneDiff';
 import SnippetCompare from './SnippetCompare';
+import MultiCompare from './MultiCompare';
+import RenderingSets from './RenderingSets';
 
 const API = '/api';
 
@@ -28,6 +30,8 @@ const FILE_TYPE_META = {
   pdf:  { label: 'PDF', color: 'bg-red-100 text-red-800', icon: 'PDF' },
   rtf:  { label: 'RTF', color: 'bg-gray-100 text-gray-800', icon: 'R' },
   txt:  { label: 'Text', color: 'bg-gray-100 text-gray-700', icon: 'T' },
+  html: { label: 'HTML', color: 'bg-cyan-100 text-cyan-800', icon: 'H' },
+  htm:  { label: 'HTML', color: 'bg-cyan-100 text-cyan-800', icon: 'H' },
 };
 
 // ─── SAFE HTML RENDER (sanitized with DOMPurify) ───
@@ -119,6 +123,16 @@ function DownloadButtons({ docId, versionA, versionB, fileType, latestVersionId 
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
           </svg>
           Als PDF
+        </a>
+
+        {/* PDF/A */}
+        <a href={`${API}/redline/${docId}/${versionA}/${versionB}?format=pdfa`}
+          className={`${btnBase} bg-amber-600 hover:bg-amber-700 text-white`}
+          download>
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+          </svg>
+          PDF/A (Archiv)
         </a>
 
         {/* Changed pages/sections only */}
@@ -245,6 +259,10 @@ function DiffView({ diffResult, compareOptions, onCompareOptionsChange, onRerunD
       <div className="flex flex-wrap gap-4 items-start">
         <CompareSettings options={compareOptions || {}} onChange={(opts) => { if (onCompareOptionsChange) onCompareOptionsChange(opts); }} />
         <ColorConfig colors={colors} onChange={setColors} />
+        <RenderingSets onApply={(settings) => {
+          if (settings?.colors) setColors(settings.colors);
+          if (settings?.options && onCompareOptionsChange) onCompareOptionsChange(settings.options);
+        }} />
       </div>
 
       {/* Filters + Navigation + View toggles */}
@@ -582,7 +600,7 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
   const [error, setError] = useState('');
   const [dragOver, setDragOver] = useState(false);
 
-  const ALLOWED = ['.docx', '.xlsx', '.pptx', '.pdf', '.rtf', '.txt'];
+  const ALLOWED = ['.docx', '.xlsx', '.pptx', '.pdf', '.rtf', '.txt', '.html', '.htm'];
   const isAllowed = (name) => ALLOWED.some(ext => name.toLowerCase().endsWith(ext));
   const getExt = (name) => name.split('.').pop().toLowerCase();
 
@@ -631,7 +649,7 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
   const handleFiles = (files) => {
     const valid = Array.from(files).filter(f => isAllowed(f.name));
     if (valid.length === 0) {
-      setError('Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF');
+      setError('Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF, RTF, TXT, HTML');
       return;
     }
     setError('');
@@ -767,7 +785,7 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
           if (!loading) document.getElementById('quick-file-input')?.click();
         }}
       >
-        <input id="quick-file-input" type="file" className="hidden" multiple accept=".docx,.xlsx,.pptx,.pdf,.rtf,.txt"
+        <input id="quick-file-input" type="file" className="hidden" multiple accept=".docx,.xlsx,.pptx,.pdf,.rtf,.txt,.html,.htm"
           onChange={e => { handleFiles(e.target.files); e.target.value = ''; }} />
 
         {loading ? (
@@ -928,7 +946,7 @@ function UploadModal({ onClose, onUpload, documents }) {
 
           <div className="mb-4">
             <label className="block border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:border-primary-400 transition-colors">
-              <input type="file" className="hidden" accept=".docx,.xlsx,.pptx,.pdf,.rtf,.txt"
+              <input type="file" className="hidden" accept=".docx,.xlsx,.pptx,.pdf,.rtf,.txt,.html,.htm"
                 onChange={e => setFile(e.target.files[0])} />
               {file ? (
                 <span className="text-sm font-medium text-primary-700">{file.name}</span>
@@ -966,7 +984,7 @@ export default function App() {
   const [versionB, setVersionB] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [quickDiff, setQuickDiff] = useState(null);
-  const [appMode, setAppMode] = useState('file'); // 'file' | 'snippet'
+  const [appMode, setAppMode] = useState('file'); // 'file' | 'snippet' | 'multi'
   const [snippetDiff, setSnippetDiff] = useState(null);
   const [compareOptions, setCompareOptions] = useState({});
 
@@ -1054,6 +1072,10 @@ export default function App() {
               className={`px-3 py-1 rounded text-xs font-medium transition-colors ${appMode === 'file' ? 'bg-white shadow text-gray-800' : 'text-gray-500'}`}>
               Datei-Vergleich
             </button>
+            <button onClick={() => setAppMode('multi')}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${appMode === 'multi' ? 'bg-white shadow text-gray-800' : 'text-gray-500'}`}>
+              1:Many
+            </button>
             <button onClick={() => setAppMode('snippet')}
               className={`px-3 py-1 rounded text-xs font-medium transition-colors ${appMode === 'snippet' ? 'bg-white shadow text-gray-800' : 'text-gray-500'}`}>
               Text-Vergleich
@@ -1078,7 +1100,7 @@ export default function App() {
                 Keine Dokumente.<br />Laden Sie eine Datei hoch.
               </div>
             )}
-            {['docx', 'xlsx', 'pptx', 'pdf', 'rtf', 'txt'].map(type => {
+            {['docx', 'xlsx', 'pptx', 'pdf', 'rtf', 'txt', 'html', 'htm'].map(type => {
               const docs = grouped[type];
               if (!docs || docs.length === 0) return null;
               const meta = FILE_TYPE_META[type];
@@ -1107,7 +1129,9 @@ export default function App() {
 
         {/* MAIN AREA */}
         <main className="flex-1 overflow-y-auto p-6">
-          {appMode === 'snippet' ? (
+          {appMode === 'multi' ? (
+            <MultiCompare onResult={(data) => {}} />
+          ) : appMode === 'snippet' ? (
             <div>
               {snippetDiff ? (
                 <div>

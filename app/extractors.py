@@ -822,8 +822,29 @@ def extract_pptx(filepath):
     return elements, plain_text
 
 
+def _ocr_page_image(page):
+    """Apply OCR to a PDF page that appears to be image-based (scanned).
+    Returns extracted text or empty string if OCR is not available."""
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+
+        # Convert pdfplumber page to image
+        img = page.to_image(resolution=300)
+        # img.original is a PIL Image
+        pil_img = img.original
+        text = pytesseract.image_to_string(pil_img, lang='deu+eng')
+        return text.strip()
+    except ImportError:
+        return ''  # pytesseract not installed
+    except Exception:
+        return ''
+
+
 def extract_pdf(filepath):
-    """Extract text from PDF files using pdfplumber with font info."""
+    """Extract text from PDF files using pdfplumber with font info.
+    Automatically applies OCR for scanned/image-based pages when pytesseract is available."""
     import pdfplumber
     pages = []
     plain_parts = []
@@ -832,8 +853,15 @@ def extract_pdf(filepath):
         for page_num, page in enumerate(pdf.pages, 1):
             text = page.extract_text() or ''
 
-            # Extract character-level font info for formatting detection
+            # If page has very little text but has images, try OCR
             chars = page.chars or []
+            is_scanned = len(chars) < 10 and len(page.images or []) > 0
+            if is_scanned and not text.strip():
+                ocr_text = _ocr_page_image(page)
+                if ocr_text:
+                    text = f'[OCR] {ocr_text}'
+
+            # Extract character-level font info for formatting detection
             font_info = {}
             for char in chars:
                 font_name = char.get('fontname', '')
@@ -852,6 +880,7 @@ def extract_pdf(filepath):
                 'text': text,
                 'html': html,
                 'font_info': font_info,
+                'ocr': is_scanned,
             })
             plain_parts.append(text)
 
@@ -905,6 +934,52 @@ def extract_rtf(filepath):
     return paragraphs, '\n'.join(plain_parts)
 
 
+def extract_html(filepath):
+    """Extract text from HTML files using basic parsing."""
+    import re as _re
+    # Try UTF-8, then latin-1
+    for enc in ['utf-8', 'utf-8-sig', 'latin-1']:
+        try:
+            with open(filepath, 'r', encoding=enc) as f:
+                content = f.read()
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        content = ''
+
+    # Remove script and style blocks
+    content = _re.sub(r'<script[^>]*>.*?</script>', '', content, flags=_re.DOTALL | _re.IGNORECASE)
+    content = _re.sub(r'<style[^>]*>.*?</style>', '', content, flags=_re.DOTALL | _re.IGNORECASE)
+
+    # Extract text from remaining HTML
+    # Replace block elements with newlines
+    for tag in ('p', 'div', 'br', 'li', 'tr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th'):
+        content = _re.sub(rf'</?{tag}[^>]*>', '\n', content, flags=_re.IGNORECASE)
+
+    # Strip remaining tags
+    text = _re.sub(r'<[^>]+>', '', content)
+    # Decode HTML entities
+    from html import unescape
+    text = unescape(text)
+    # Clean up whitespace
+    lines = [l.strip() for l in text.split('\n')]
+    lines = [l for l in lines if l]  # remove empty lines
+
+    paragraphs = []
+    plain_parts = []
+    for i, line in enumerate(lines):
+        paragraphs.append({
+            'index': i,
+            'text': line,
+            'html': escape(line),
+            'formatting': [{'text': line}],
+        })
+        plain_parts.append(line)
+
+    return paragraphs, '\n'.join(plain_parts)
+
+
 def extract_txt(filepath):
     """Extract text from plain text files."""
     # Try UTF-8, then latin-1
@@ -939,6 +1014,8 @@ EXTRACTORS = {
     'pdf': extract_pdf,
     'rtf': extract_rtf,
     'txt': extract_txt,
+    'html': extract_html,
+    'htm': extract_html,
 }
 
 
