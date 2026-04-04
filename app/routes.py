@@ -562,18 +562,25 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
         dele.append(run_el)
         return dele
 
-    def add_comment_ref(p_el, comment_id):
-        """Add a w:commentRangeStart, w:commentRangeEnd, and w:commentReference to a paragraph."""
-        crs = etree.SubElement(p_el, f'{{{W}}}commentRangeStart')
-        crs.set(f'{{{W}}}id', str(comment_id))
-        cre = etree.SubElement(p_el, f'{{{W}}}commentRangeEnd')
-        cre.set(f'{{{W}}}id', str(comment_id))
-        r_ref = etree.SubElement(p_el, f'{{{W}}}r')
-        rpr = etree.SubElement(r_ref, f'{{{W}}}rPr')
-        rstyle = etree.SubElement(rpr, f'{{{W}}}rStyle')
-        rstyle.set(f'{{{W}}}val', 'CommentReference')
-        cr = etree.SubElement(r_ref, f'{{{W}}}commentReference')
-        cr.set(f'{{{W}}}id', str(comment_id))
+    bookmark_id_gen = iter(range(1000, 200000))
+
+    def add_bookmark(p_el, change_num):
+        """Add a w:bookmarkStart / w:bookmarkEnd pair to mark a change for cross-referencing."""
+        bm_id = str(next(bookmark_id_gen))
+        bm_name = f'_MyCompare_Change_{change_num}'
+        # bookmarkStart must come before content, bookmarkEnd after
+        bm_start = etree.Element(f'{{{W}}}bookmarkStart')
+        bm_start.set(f'{{{W}}}id', bm_id)
+        bm_start.set(f'{{{W}}}name', bm_name)
+        bm_end = etree.Element(f'{{{W}}}bookmarkEnd')
+        bm_end.set(f'{{{W}}}id', bm_id)
+        # Insert bookmarkStart after pPr (if present), before runs
+        ppr = p_el.find(f'{{{W}}}pPr')
+        if ppr is not None:
+            ppr.addnext(bm_start)
+        else:
+            p_el.insert(0, bm_start)
+        p_el.append(bm_end)
 
     # ── Move detection ──
     # Find paragraphs that were deleted in A and inserted in B (same text = move)
@@ -671,6 +678,7 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
 
                 if old_text and new_text:
                     cnum = record_change('Ersetzung', old_text, new_text, new_idx or old_idx)
+                    add_bookmark(p_el, cnum)
                     # Word-level diff
                     words_a = re.findall(r'\S+|\s+', old_text)
                     words_b = re.findall(r'\S+|\s+', new_text)
@@ -692,25 +700,28 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                             r_ins = make_run_element(''.join(words_b[wj1:wj2]), rpr_b)
                             p_el.append(wrap_in_ins(r_ins))
                 elif old_text:
-                    record_change('Löschung', old_text, '', old_idx)
+                    cnum = record_change('Löschung', old_text, '', old_idx)
+                    add_bookmark(p_el, cnum)
                     r_del = make_run_element(old_text, rpr_a)
                     p_el.append(wrap_in_del(r_del))
                 elif new_text:
-                    record_change('Einfügung', '', new_text, new_idx)
+                    cnum = record_change('Einfügung', '', new_text, new_idx)
+                    add_bookmark(p_el, cnum)
                     r_ins = make_run_element(new_text, rpr_b)
                     p_el.append(wrap_in_ins(r_ins))
 
         elif tag == 'delete':
             for idx in range(i1, i2):
                 if idx in moved_from_a:
-                    record_change('Verschoben (Quelle)', paras_a[idx], '', idx)
+                    cnum = record_change('Verschoben (Quelle)', paras_a[idx], '', idx)
                 else:
-                    record_change('Löschung', paras_a[idx], '', idx)
+                    cnum = record_change('Löschung', paras_a[idx], '', idx)
 
                 p_el = etree.SubElement(body, f'{{{W}}}p')
                 src_ppr = doc_a.paragraphs[idx]._element.find(f'{{{W}}}pPr')
                 if src_ppr is not None:
                     p_el.append(etree.fromstring(etree.tostring(src_ppr)))
+                add_bookmark(p_el, cnum)
 
                 # Copy all runs from source with their formatting, wrapped in del
                 src_runs = doc_a.paragraphs[idx]._element.findall(f'{{{W}}}r')
@@ -741,14 +752,15 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
         elif tag == 'insert':
             for idx in range(j1, j2):
                 if idx in moved_to_b:
-                    record_change('Verschoben (Ziel)', '', paras_b[idx], idx)
+                    cnum = record_change('Verschoben (Ziel)', '', paras_b[idx], idx)
                 else:
-                    record_change('Einfügung', '', paras_b[idx], idx)
+                    cnum = record_change('Einfügung', '', paras_b[idx], idx)
 
                 p_el = etree.SubElement(body, f'{{{W}}}p')
                 src_ppr = doc_b.paragraphs[idx]._element.find(f'{{{W}}}pPr')
                 if src_ppr is not None:
                     p_el.append(etree.fromstring(etree.tostring(src_ppr)))
+                add_bookmark(p_el, cnum)
 
                 # Copy all runs from source with their formatting, wrapped in ins
                 src_runs = doc_b.paragraphs[idx]._element.findall(f'{{{W}}}r')
@@ -1046,12 +1058,13 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
     run.font.bold = True
     run.font.color.rgb = CLR_TITLE
 
-    changes_table = report.add_table(rows=1, cols=3)
+    changes_table = report.add_table(rows=1, cols=4)
     changes_table.alignment = WD_TABLE_ALIGNMENT.LEFT
     hdr = changes_table.rows[0].cells
     hdr[0].text = 'Nr.'
     hdr[1].text = 'Typ'
-    hdr[2].text = 'Änderung'
+    hdr[2].text = 'Alter Text'
+    hdr[3].text = 'Neuer Text'
     for cell in hdr:
         set_cell_bg(cell, '1565C0')
         for p in cell.paragraphs:
@@ -1081,10 +1094,24 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
                 r.font.bold = True
                 r.font.color.rgb = type_color
 
-        # Änderung — colored markup
-        markup_para = row[2].paragraphs[0]
-        markup_para.clear()
-        add_markup_runs(markup_para, change)
+        # Alter Text — plain, with strikethrough for deletions
+        old_para = row[2].paragraphs[0]
+        old_para.clear()
+        old_text = change['old'][:200] if change['old'] else '—'
+        if change['type'] in ('Löschung', 'Verschoben (Quelle)'):
+            color = CLR_MOVE if 'Verschoben' in change['type'] else CLR_DEL
+            r = old_para.add_run(old_text)
+            r.font.size = Pt(8)
+            r.font.color.rgb = color
+            r.font.strike = True
+        else:
+            r = old_para.add_run(old_text)
+            r.font.size = Pt(8)
+
+        # Neuer Text — with colored markup
+        new_para = row[3].paragraphs[0]
+        new_para.clear()
+        add_markup_runs(new_para, change)
 
         # Row background
         bg = type_bg_colors.get(change['type'], 'F5F5F5')
@@ -1094,9 +1121,10 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
     if total_changes > 300:
         row = changes_table.add_row().cells
         row[0].text = ''
-        row[1].merge(row[2])
-        row[1].text = f'... und {total_changes - 300} weitere Änderungen'
-        for p in row[1].paragraphs:
+        row[1].text = ''
+        row[2].merge(row[3])
+        row[2].text = f'... und {total_changes - 300} weitere Änderungen'
+        for p in row[2].paragraphs:
             for r in p.runs:
                 r.font.size = Pt(8)
                 r.font.italic = True
@@ -1104,9 +1132,10 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
 
     # Set column widths
     for row in changes_table.rows:
-        row.cells[0].width = Cm(1.2)
-        row.cells[1].width = Cm(3)
-        row.cells[2].width = Cm(13)
+        row.cells[0].width = Cm(1)
+        row.cells[1].width = Cm(2.5)
+        row.cells[2].width = Cm(7)
+        row.cells[3].width = Cm(7)
 
     report_path = os.path.join(tmpdir, 'report.docx')
     report.save(report_path)
