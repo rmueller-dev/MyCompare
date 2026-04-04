@@ -400,13 +400,12 @@ def generate_redline(doc_id, version_a, version_b):
             if not gen:
                 return jsonify({'error': 'Nicht unterstützter Dateityp'}), 400
 
-            out_path = gen(ver_a.filepath, ver_b.filepath, tmpdir)
-
-            # Convert to PDF if requested
-            if output_format == 'pdf' and not out_path.endswith('.pdf'):
-                pdf_path = _convert_to_pdf(out_path, tmpdir)
-                if pdf_path and pdf_path.endswith('.pdf'):
-                    out_path = pdf_path
+            # If PDF format requested, generate PDF redline directly (no LibreOffice needed)
+            if output_format == 'pdf' and doc.file_type != 'pdf':
+                out_path = _generate_redline_pdf(
+                    ver_a.filepath, ver_b.filepath, doc.file_type, tmpdir)
+            else:
+                out_path = gen(ver_a.filepath, ver_b.filepath, tmpdir)
 
             ext = os.path.splitext(out_path)[1]
             dl_name = f"{doc.name}_Aenderungen_V{version_a}_vs_V{version_b}{ext}"
@@ -1464,19 +1463,23 @@ def export_changed_pages(doc_id, version_a, version_b):
 
 def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir):
     """
-    Generate a PDF redline showing all changes:
-    - Deleted text in red with strikethrough
-    - Inserted text in blue with underline
-    - Unchanged text in black
+    Generate a professional PDF redline with Litera Compare-style formatting:
+    - Title page with legend, statistics table, numbered change list
+    - Full document text with inline change markup (red strikethrough / blue underline)
+    - Word-level granularity for replacements
+    - Move detection
     Works for all file types.
     """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.colors import HexColor
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.colors import HexColor, black
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                     Table, TableStyle, PageBreak)
     from reportlab.lib.units import mm
     from reportlab.lib import colors
     from html import escape
+    from collections import Counter
+    from datetime import datetime
     import difflib
     import re
 
@@ -1490,33 +1493,208 @@ def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir):
                             topMargin=15*mm, bottomMargin=15*mm)
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle('RTitle', parent=styles['Title'], fontSize=14,
-                                  spaceAfter=6*mm)
+    title_style = ParagraphStyle('RTitle', parent=styles['Title'], fontSize=18,
+                                  spaceAfter=4*mm, textColor=HexColor('#1565C0'))
+    subtitle_style = ParagraphStyle('RSub', parent=styles['Normal'], fontSize=11,
+                                     spaceAfter=2*mm, textColor=HexColor('#666666'),
+                                     alignment=1)
+    heading_style = ParagraphStyle('RH', parent=styles['Heading2'], fontSize=14,
+                                    textColor=HexColor('#1F3864'), spaceBefore=6*mm,
+                                    spaceAfter=3*mm)
     body_style = ParagraphStyle('RBody', parent=styles['Normal'],
-                                 fontSize=10, leading=14,
-                                 fontName='Helvetica')
-    legend_style = ParagraphStyle('RLegend', parent=styles['Normal'],
-                                   fontSize=8, leading=10, textColor=colors.grey)
+                                 fontSize=10, leading=14, fontName='Helvetica')
+    small_style = ParagraphStyle('RSmall', parent=styles['Normal'],
+                                  fontSize=8, leading=10, textColor=colors.grey)
+    legend_label = ParagraphStyle('RLbl', parent=styles['Normal'],
+                                   fontSize=9, leading=12, fontName='Helvetica-Bold')
 
-    story = []
-    story.append(Paragraph("Änderungsbericht (Redline)", title_style))
-
-    # Legend
-    legend_html = (
-        '<font color="red"><strike>Rot durchgestrichen</strike></font> = gelöscht &nbsp;&nbsp; '
-        '<font color="blue"><u>Blau unterstrichen</u></font> = eingefügt &nbsp;&nbsp; '
-        'Schwarz = unverändert'
-    )
-    story.append(Paragraph(legend_html, legend_style))
-    story.append(Spacer(1, 4*mm))
-
-    # Get lines
+    # ── Compute diff and collect changes ──
     lines_a = text_a.splitlines()
     lines_b = text_b.splitlines()
 
-    sm = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+    # Move detection
+    sm_pre = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+    deleted_lines = {}
+    inserted_lines = {}
+    for tag, i1, i2, j1, j2 in sm_pre.get_opcodes():
+        if tag == 'delete':
+            for idx in range(i1, i2):
+                txt = lines_a[idx].strip()
+                if txt and len(txt) > 15:
+                    deleted_lines.setdefault(txt, []).append(idx)
+        elif tag == 'insert':
+            for idx in range(j1, j2):
+                txt = lines_b[idx].strip()
+                if txt and len(txt) > 15:
+                    inserted_lines.setdefault(txt, []).append(idx)
 
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    moved_from = set()
+    moved_to = set()
+    for txt in deleted_lines:
+        if txt in inserted_lines:
+            for a_idx, b_idx in zip(deleted_lines[txt], inserted_lines[txt]):
+                moved_from.add(a_idx)
+                moved_to.add(b_idx)
+
+    # Collect all changes
+    all_changes = []
+    change_num = [0]
+
+    def record(ctype, old='', new=''):
+        change_num[0] += 1
+        all_changes.append({
+            'num': change_num[0], 'type': ctype,
+            'old': (old or '')[:100], 'new': (new or '')[:100]
+        })
+
+    sm = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+    opcodes = sm.get_opcodes()
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == 'replace':
+            for idx in range(max(i2 - i1, j2 - j1)):
+                old = lines_a[i1 + idx] if (i1 + idx) < i2 else ''
+                new = lines_b[j1 + idx] if (j1 + idx) < j2 else ''
+                if old and new:
+                    record('Ersetzung', old, new)
+                elif old:
+                    record('Löschung', old)
+                else:
+                    record('Einfügung', new=new)
+        elif tag == 'delete':
+            for idx in range(i1, i2):
+                if idx in moved_from:
+                    record('Verschoben (Quelle)', lines_a[idx])
+                else:
+                    record('Löschung', lines_a[idx])
+        elif tag == 'insert':
+            for idx in range(j1, j2):
+                if idx in moved_to:
+                    record('Verschoben (Ziel)', new=lines_b[idx])
+                else:
+                    record('Einfügung', new=lines_b[idx])
+
+    type_counts = Counter(c['type'] for c in all_changes)
+    total_changes = len(all_changes)
+
+    # ── Build PDF story ──
+    story = []
+
+    # ─── Page 1: Title & Legend ───
+    story.append(Paragraph("Änderungsbericht", title_style))
+    story.append(Paragraph("MyCompare — Dokumentenvergleich", subtitle_style))
+    story.append(Paragraph(
+        f"Erstellt am: {datetime.now().strftime('%d.%m.%Y %H:%M')}", subtitle_style))
+    story.append(Spacer(1, 8*mm))
+
+    story.append(Paragraph("Legende", heading_style))
+    legend_data = [
+        ['Darstellung', 'Bedeutung'],
+        [Paragraph('<font color="red"><strike>Rot durchgestrichen</strike></font>', body_style),
+         'Gelöschter Text'],
+        [Paragraph('<font color="blue"><u>Blau unterstrichen</u></font>', body_style),
+         'Eingefügter Text'],
+        [Paragraph('<font color="#6A1B9A">Lila</font>', body_style),
+         'Verschobener Text'],
+        ['Schwarz', 'Unveränderter Text'],
+    ]
+    legend_tbl = Table(legend_data, colWidths=[60*mm, 90*mm])
+    legend_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), HexColor('#1565C0')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#BDBDBD')),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    story.append(legend_tbl)
+    story.append(Spacer(1, 6*mm))
+
+    # ─── Statistics ───
+    story.append(Paragraph("Änderungsstatistik", heading_style))
+    type_colors_map = {
+        'Einfügung': '#E8F5E9', 'Löschung': '#FFEBEE', 'Ersetzung': '#FFF8E1',
+        'Verschoben (Quelle)': '#F3E5F5', 'Verschoben (Ziel)': '#F3E5F5',
+    }
+    stats_data = [['Änderungstyp', 'Anzahl']]
+    stats_styles = [
+        ('BACKGROUND', (0, 0), (-1, 0), HexColor('#1565C0')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#BDBDBD')),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+    ]
+    row_idx = 1
+    for ctype, count in type_counts.most_common():
+        stats_data.append([ctype, str(count)])
+        bg = type_colors_map.get(ctype, '#F5F5F5')
+        stats_styles.append(('BACKGROUND', (0, row_idx), (-1, row_idx), HexColor(bg)))
+        row_idx += 1
+    stats_data.append(['Gesamt', str(total_changes)])
+    stats_styles.append(('BACKGROUND', (0, row_idx), (-1, row_idx), HexColor('#E3F2FD')))
+    stats_styles.append(('FONTNAME', (0, row_idx), (-1, row_idx), 'Helvetica-Bold'))
+
+    stats_tbl = Table(stats_data, colWidths=[80*mm, 30*mm])
+    stats_tbl.setStyle(TableStyle(stats_styles))
+    story.append(stats_tbl)
+
+    # ─── Change List ───
+    story.append(PageBreak())
+    story.append(Paragraph("Änderungsliste", heading_style))
+
+    changes_data = [['Nr.', 'Typ', 'Alter Text', 'Neuer Text']]
+    changes_styles = [
+        ('BACKGROUND', (0, 0), (-1, 0), HexColor('#1565C0')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 7),
+        ('GRID', (0, 0), (-1, -1), 0.5, HexColor('#BDBDBD')),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('TOPPADDING', (0, 0), (-1, -1), 2),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ('LEFTPADDING', (0, 0), (-1, -1), 4),
+    ]
+    for i, change in enumerate(all_changes[:150]):
+        old_d = escape(change['old']) if change['old'] else '—'
+        new_d = escape(change['new']) if change['new'] else '—'
+        changes_data.append([
+            str(change['num']), change['type'],
+            Paragraph(f'<font size="7">{old_d}</font>', body_style),
+            Paragraph(f'<font size="7">{new_d}</font>', body_style),
+        ])
+        bg = type_colors_map.get(change['type'], '#F5F5F5')
+        changes_styles.append(('BACKGROUND', (0, i+1), (-1, i+1), HexColor(bg)))
+
+    if total_changes > 150:
+        changes_data.append(['', f'... und {total_changes - 150} weitere', '', ''])
+
+    changes_tbl = Table(changes_data, colWidths=[12*mm, 30*mm, 60*mm, 60*mm])
+    changes_tbl.setStyle(TableStyle(changes_styles))
+    story.append(changes_tbl)
+
+    # ─── Page: Redline Document ───
+    story.append(PageBreak())
+    story.append(Paragraph("Redline-Dokument", heading_style))
+
+    # Legend reminder
+    legend_html = (
+        '<font color="red"><strike>Rot</strike></font> = gelöscht &nbsp; '
+        '<font color="blue"><u>Blau</u></font> = eingefügt &nbsp; '
+        '<font color="#6A1B9A">Lila</font> = verschoben &nbsp; '
+        'Schwarz = unverändert'
+    )
+    story.append(Paragraph(legend_html, small_style))
+    story.append(Spacer(1, 4*mm))
+
+    # Render full document with inline changes
+    for tag, i1, i2, j1, j2 in opcodes:
         if tag == 'equal':
             for idx in range(i1, i2):
                 safe = escape(lines_a[idx]) or '&nbsp;'
@@ -1528,7 +1706,6 @@ def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir):
                 new_line = lines_b[j1 + idx] if (j1 + idx) < j2 else ''
 
                 if old_line and new_line:
-                    # Word-level diff
                     words_a = re.findall(r'\S+|\s+', old_line)
                     words_b = re.findall(r'\S+|\s+', new_line)
                     wsm = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
@@ -1554,14 +1731,24 @@ def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir):
         elif tag == 'delete':
             for idx in range(i1, i2):
                 safe = escape(lines_a[idx])
-                story.append(Paragraph(f'<font color="red"><strike>{safe}</strike></font>', body_style))
+                if idx in moved_from:
+                    story.append(Paragraph(
+                        f'<font color="#6A1B9A"><strike>{safe}</strike> [verschoben]</font>', body_style))
+                else:
+                    story.append(Paragraph(
+                        f'<font color="red"><strike>{safe}</strike></font>', body_style))
 
         elif tag == 'insert':
             for idx in range(j1, j2):
                 safe = escape(lines_b[idx])
-                story.append(Paragraph(f'<font color="blue"><u>{safe}</u></font>', body_style))
+                if idx in moved_to:
+                    story.append(Paragraph(
+                        f'<font color="#6A1B9A"><u>{safe}</u> [hierhin verschoben]</font>', body_style))
+                else:
+                    story.append(Paragraph(
+                        f'<font color="blue"><u>{safe}</u></font>', body_style))
 
-    if not story or len(story) <= 3:
+    if total_changes == 0:
         story.append(Paragraph("Keine Änderungen erkannt.", body_style))
 
     doc.build(story)
