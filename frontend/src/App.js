@@ -435,17 +435,29 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
     if (!documents || documents.length === 0) return null;
     const ext = getExt(filename);
     const baseName = filename.replace(/\.[^.]+$/, '').toLowerCase();
-    // Look for a document with same type and similar name
-    for (const doc of documents) {
-      if (doc.file_type !== ext) continue;
+
+    // 1. Exact name match on doc name or version filename
+    const sameType = documents.filter(d => d.file_type === ext && (d.versions || []).length > 0);
+    for (const doc of sameType) {
       const docBase = doc.name.toLowerCase();
-      // Match if names overlap or if any version has a matching filename
+      if (docBase === baseName) return doc;
+      for (const v of (doc.versions || [])) {
+        const vBase = v.filename.replace(/\.[^.]+$/, '').toLowerCase();
+        if (vBase === baseName) return doc;
+      }
+    }
+    // 2. Partial name match
+    for (const doc of sameType) {
+      const docBase = doc.name.toLowerCase();
       if (docBase.includes(baseName) || baseName.includes(docBase)) return doc;
       for (const v of (doc.versions || [])) {
         const vBase = v.filename.replace(/\.[^.]+$/, '').toLowerCase();
-        if (vBase === baseName || vBase.includes(baseName) || baseName.includes(vBase)) return doc;
+        if (vBase.includes(baseName) || baseName.includes(vBase)) return doc;
       }
     }
+    // 3. If only one document of this type exists, use it
+    if (sameType.length === 1) return sameType[0];
+
     return null;
   };
 
@@ -941,15 +953,19 @@ export default function App() {
                     Erstellt: {selectedDoc.created_at ? new Date(selectedDoc.created_at).toLocaleDateString('de-DE') : '—'}
                   </p>
                 </div>
-                <button onClick={() => deleteDocument(selectedDoc.id)}
-                  className="text-sm text-red-500 hover:text-red-700 hover:bg-red-50 px-3 py-1.5 rounded">
-                  Löschen
-                </button>
+                <div className="flex gap-2">
+                  <button onClick={() => deleteDocument(selectedDoc.id)}
+                    className="text-sm text-red-500 hover:text-red-700 hover:bg-red-50 px-3 py-1.5 rounded">
+                    Löschen
+                  </button>
+                </div>
               </div>
 
-              {/* Version timeline */}
+              {/* Version timeline + upload new version */}
               <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wider mb-3">Versionen</h3>
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wider">Versionen</h3>
+                </div>
                 <div className="space-y-2">
                   {versions.map(v => (
                     <div key={v.id} className="flex items-center gap-3 bg-white border rounded-lg p-3">
@@ -967,6 +983,50 @@ export default function App() {
                         className="text-xs text-primary-600 hover:underline">Download</a>
                     </div>
                   ))}
+
+                  {/* Add new version button */}
+                  <label className="flex items-center gap-3 border-2 border-dashed border-gray-300 rounded-lg p-3 cursor-pointer hover:border-primary-400 hover:bg-primary-50 transition-colors">
+                    <div className="w-8 h-8 rounded-full bg-gray-100 text-gray-400 flex items-center justify-center font-bold text-lg">+</div>
+                    <div className="flex-1">
+                      <div className="text-sm font-medium text-gray-600">Neue Version hochladen</div>
+                      <div className="text-xs text-gray-400">Wird automatisch mit der letzten Version verglichen</div>
+                    </div>
+                    <input type="file" className="hidden" accept={`.${selectedDoc.file_type}`}
+                      onChange={async (e) => {
+                        const file = e.target.files[0];
+                        if (!file) return;
+                        e.target.value = '';
+                        const formData = new FormData();
+                        formData.append('file', file);
+                        formData.append('document_id', String(selectedDoc.id));
+                        formData.append('label', '');
+                        try {
+                          const res = await fetch(`${API}/documents`, { method: 'POST', body: formData });
+                          const data = await res.json();
+                          if (!res.ok) throw new Error(data.error || 'Upload fehlgeschlagen');
+                          // Refresh doc and auto-diff last two versions
+                          const updatedDoc = data;
+                          loadDocuments();
+                          setSelectedDoc(updatedDoc);
+                          const vs = updatedDoc.versions || [];
+                          if (vs.length >= 2) {
+                            const va = vs[vs.length - 2].version_number;
+                            const vb = vs[vs.length - 1].version_number;
+                            setVersionA(va);
+                            setVersionB(vb);
+                            setDiffLoading(true);
+                            setDiffResult(null);
+                            const diffRes = await fetch(`${API}/diff/${updatedDoc.id}/${va}/${vb}`);
+                            const diffData = await diffRes.json();
+                            if (diffRes.ok) setDiffResult(diffData);
+                            setDiffLoading(false);
+                          }
+                        } catch (err) {
+                          alert('Fehler: ' + err.message);
+                        }
+                      }}
+                    />
+                  </label>
                 </div>
               </div>
 
