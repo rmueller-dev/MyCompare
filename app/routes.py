@@ -434,123 +434,168 @@ def generate_redline(doc_id, version_a, version_b):
 
 def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
     """
-    Generate a DOCX with visual tracked changes.
-    Deletions shown in red strikethrough, insertions in blue underlined.
+    Generate a DOCX with real Word tracked changes (w:ins / w:del XML elements).
+    Word will show these as proper revision marks that can be accepted/rejected.
     """
     from docx import Document as DocxDocument
-    from docx.shared import Pt, RGBColor
-    from docx.enum.text import WD_COLOR_INDEX
+    from lxml import etree
     import difflib
+    import re
+    from datetime import datetime
 
-    doc_a = DocxDocument(filepath_a)
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    nsmap = {'w': W}
+    author = 'MyCompare'
+    date_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
     doc_b = DocxDocument(filepath_b)
+    doc_a = DocxDocument(filepath_a)
 
-    # Extract paragraph texts
     paras_a = [p.text for p in doc_a.paragraphs]
     paras_b = [p.text for p in doc_b.paragraphs]
 
-    # Create output document based on version B structure
-    out_doc = DocxDocument()
+    def make_run_element(text, rpr_source=None):
+        """Create a w:r element with text."""
+        r = etree.SubElement(etree.Element('dummy'), f'{{{W}}}r')
+        if rpr_source is not None:
+            rpr = rpr_source.find(f'{{{W}}}rPr')
+            if rpr is not None:
+                r.append(etree.fromstring(etree.tostring(rpr)))
+        t = etree.SubElement(r, f'{{{W}}}t')
+        t.text = text
+        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        return r
 
-    # Copy styles from version B if possible
+    def wrap_in_ins(run_el):
+        """Wrap a run element in w:ins (insertion revision)."""
+        ins = etree.Element(f'{{{W}}}ins')
+        ins.set(f'{{{W}}}id', str(next(rev_id_gen)))
+        ins.set(f'{{{W}}}author', author)
+        ins.set(f'{{{W}}}date', date_str)
+        ins.append(run_el)
+        return ins
+
+    def wrap_in_del(run_el):
+        """Wrap a run element in w:del (deletion revision), using w:delText."""
+        dele = etree.Element(f'{{{W}}}del')
+        dele.set(f'{{{W}}}id', str(next(rev_id_gen)))
+        dele.set(f'{{{W}}}author', author)
+        dele.set(f'{{{W}}}date', date_str)
+        # Change w:t to w:delText
+        t_el = run_el.find(f'{{{W}}}t')
+        if t_el is not None:
+            dt = etree.SubElement(run_el, f'{{{W}}}delText')
+            dt.text = t_el.text
+            dt.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            run_el.remove(t_el)
+        dele.append(run_el)
+        return dele
+
+    # Revision ID generator
+    rev_id_counter = [100]
+    def _next_rev_id():
+        rev_id_counter[0] += 1
+        return rev_id_counter[0]
+    rev_id_gen = iter(range(100, 100000))
+
+    # Work on a copy of doc_b (preserves all original formatting/styles)
+    import shutil
+    work_path = os.path.join(tmpdir, '_work.docx')
+    shutil.copy2(filepath_b, work_path)
+    out_doc = DocxDocument(work_path)
+
+    # Clear all paragraphs in out_doc body
+    body = out_doc.element.body
+    for p_el in body.findall(f'{{{W}}}p'):
+        body.remove(p_el)
+
     sm = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == 'equal':
+            # Copy paragraphs from B as-is (they have correct formatting)
             for idx in range(j1, j2):
-                # Copy paragraph from B as-is
-                src_para = doc_b.paragraphs[idx]
-                p = out_doc.add_paragraph()
-                if src_para.style:
-                    try:
-                        p.style = out_doc.styles[src_para.style.name]
-                    except KeyError:
-                        pass
-                p.alignment = src_para.alignment
-                for run in src_para.runs:
-                    new_run = p.add_run(run.text)
-                    new_run.bold = run.bold
-                    new_run.italic = run.italic
-                    new_run.underline = run.underline
-                    if run.font.size:
-                        new_run.font.size = run.font.size
-                    if run.font.name:
-                        new_run.font.name = run.font.name
-                    if run.font.color and run.font.color.rgb:
-                        new_run.font.color.rgb = run.font.color.rgb
+                p_el = etree.fromstring(etree.tostring(doc_b.paragraphs[idx]._element))
+                body.append(p_el)
 
         elif tag == 'replace':
-            # Show deleted text then inserted text with word-level detail
-            for idx in range(i1, i2):
-                old_text = paras_a[idx]
-                # Find best matching new paragraph
-                new_idx = j1 + (idx - i1) if (j1 + (idx - i1)) < j2 else None
+            for idx in range(max(i2 - i1, j2 - j1)):
+                old_idx = i1 + idx if (i1 + idx) < i2 else None
+                new_idx = j1 + idx if (j1 + idx) < j2 else None
+                old_text = paras_a[old_idx] if old_idx is not None else ''
                 new_text = paras_b[new_idx] if new_idx is not None else ''
 
-                p = out_doc.add_paragraph()
+                # Create paragraph element (copy pPr from new version if available)
+                p_el = etree.SubElement(body, f'{{{W}}}p')
+                if new_idx is not None:
+                    src_ppr = doc_b.paragraphs[new_idx]._element.find(f'{{{W}}}pPr')
+                    if src_ppr is not None:
+                        p_el.append(etree.fromstring(etree.tostring(src_ppr)))
+                elif old_idx is not None:
+                    src_ppr = doc_a.paragraphs[old_idx]._element.find(f'{{{W}}}pPr')
+                    if src_ppr is not None:
+                        p_el.append(etree.fromstring(etree.tostring(src_ppr)))
 
                 if old_text and new_text:
-                    # Word-level diff within the paragraph
-                    import re
+                    # Word-level diff
                     words_a = re.findall(r'\S+|\s+', old_text)
                     words_b = re.findall(r'\S+|\s+', new_text)
                     wsm = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
 
                     for wtag, wi1, wi2, wj1, wj2 in wsm.get_opcodes():
                         if wtag == 'equal':
-                            run = p.add_run(''.join(words_b[wj1:wj2]))
+                            r = make_run_element(''.join(words_b[wj1:wj2]))
+                            p_el.append(r)
                         elif wtag == 'replace':
                             # Deleted words
-                            run = p.add_run(''.join(words_a[wi1:wi2]))
-                            run.font.strike = True
-                            run.font.color.rgb = RGBColor(0xDC, 0x26, 0x26)
+                            r_del = make_run_element(''.join(words_a[wi1:wi2]))
+                            p_el.append(wrap_in_del(r_del))
                             # Inserted words
-                            run = p.add_run(''.join(words_b[wj1:wj2]))
-                            run.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
-                            run.font.underline = True
+                            r_ins = make_run_element(''.join(words_b[wj1:wj2]))
+                            p_el.append(wrap_in_ins(r_ins))
                         elif wtag == 'delete':
-                            run = p.add_run(''.join(words_a[wi1:wi2]))
-                            run.font.strike = True
-                            run.font.color.rgb = RGBColor(0xDC, 0x26, 0x26)
+                            r_del = make_run_element(''.join(words_a[wi1:wi2]))
+                            p_el.append(wrap_in_del(r_del))
                         elif wtag == 'insert':
-                            run = p.add_run(''.join(words_b[wj1:wj2]))
-                            run.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
-                            run.font.underline = True
+                            r_ins = make_run_element(''.join(words_b[wj1:wj2]))
+                            p_el.append(wrap_in_ins(r_ins))
                 elif old_text:
-                    run = p.add_run(old_text)
-                    run.font.strike = True
-                    run.font.color.rgb = RGBColor(0xDC, 0x26, 0x26)
-
-            # Any remaining new paragraphs that don't have old counterparts
-            for idx in range(j1 + (i2 - i1), j2):
-                p = out_doc.add_paragraph()
-                run = p.add_run(paras_b[idx])
-                run.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
-                run.font.underline = True
+                    r_del = make_run_element(old_text)
+                    p_el.append(wrap_in_del(r_del))
+                elif new_text:
+                    r_ins = make_run_element(new_text)
+                    p_el.append(wrap_in_ins(r_ins))
 
         elif tag == 'delete':
             for idx in range(i1, i2):
-                p = out_doc.add_paragraph()
-                run = p.add_run(paras_a[idx])
-                run.font.strike = True
-                run.font.color.rgb = RGBColor(0xDC, 0x26, 0x26)
+                p_el = etree.SubElement(body, f'{{{W}}}p')
+                src_ppr = doc_a.paragraphs[idx]._element.find(f'{{{W}}}pPr')
+                if src_ppr is not None:
+                    p_el.append(etree.fromstring(etree.tostring(src_ppr)))
+                # Mark entire paragraph as deletion
+                rpr_src = doc_a.paragraphs[idx]._element.find(f'{{{W}}}r')
+                r_del = make_run_element(paras_a[idx], rpr_src)
+                # Wrap paragraph deletion
+                dele = wrap_in_del(r_del)
+                p_el.append(dele)
+                # Also mark paragraph mark as deleted
+                ppr_del = etree.SubElement(p_el, f'{{{W}}}pPr')
+                rpr_del = etree.SubElement(ppr_del, f'{{{W}}}rPr')
+                del_elem = etree.SubElement(rpr_del, f'{{{W}}}del')
+                del_elem.set(f'{{{W}}}id', str(next(rev_id_gen)))
+                del_elem.set(f'{{{W}}}author', author)
+                del_elem.set(f'{{{W}}}date', date_str)
 
         elif tag == 'insert':
             for idx in range(j1, j2):
-                p = out_doc.add_paragraph()
-                run = p.add_run(paras_b[idx])
-                run.font.color.rgb = RGBColor(0x25, 0x63, 0xEB)
-                run.font.underline = True
+                p_el = etree.SubElement(body, f'{{{W}}}p')
+                src_ppr = doc_b.paragraphs[idx]._element.find(f'{{{W}}}pPr')
+                if src_ppr is not None:
+                    p_el.append(etree.fromstring(etree.tostring(src_ppr)))
+                rpr_src = doc_b.paragraphs[idx]._element.find(f'{{{W}}}r')
+                r_ins = make_run_element(paras_b[idx], rpr_src)
+                p_el.append(wrap_in_ins(r_ins))
 
-    # Add legend at the top
-    legend = out_doc.paragraphs[0] if out_doc.paragraphs else out_doc.add_paragraph()
-    out_doc.add_page_break()
-
-    # Insert legend before content
-    first_para = out_doc.add_paragraph()
-    first_para._element.addprevious(out_doc.add_paragraph()._element)
-
-    # Save
     out_path = os.path.join(tmpdir, 'redline.docx')
     out_doc.save(out_path)
     return out_path
@@ -1064,19 +1109,19 @@ def _clean_document_metadata(filepath, file_type, tmpdir):
 
 
 def _convert_to_pdf(filepath, tmpdir):
-    """Convert a file to PDF using LibreOffice if available, else return None."""
+    """Convert a file to PDF. Tries LibreOffice first, falls back to reportlab text extraction."""
     import subprocess
     import shutil
 
-    # Try LibreOffice
-    for lo_cmd in ['libreoffice', 'soffice', '/usr/bin/libreoffice']:
+    # Try LibreOffice first (best quality)
+    for lo_cmd in ['libreoffice', 'soffice', '/usr/bin/libreoffice',
+                    '/Applications/LibreOffice.app/Contents/MacOS/soffice']:
         if shutil.which(lo_cmd):
             try:
                 subprocess.run(
                     [lo_cmd, '--headless', '--convert-to', 'pdf', '--outdir', tmpdir, filepath],
                     timeout=60, check=True, capture_output=True,
                 )
-                # Find the output PDF
                 base = os.path.splitext(os.path.basename(filepath))[0]
                 pdf_path = os.path.join(tmpdir, f'{base}.pdf')
                 if os.path.exists(pdf_path):
@@ -1084,8 +1129,53 @@ def _convert_to_pdf(filepath, tmpdir):
             except Exception:
                 pass
 
-    # Fallback: copy original and inform
+    # Fallback: generate PDF from extracted text using reportlab
+    try:
+        ext = os.path.splitext(filepath)[1].lower()
+        from .extractors import extract
+        file_type = ext.lstrip('.')
+        if file_type in ('docx', 'xlsx', 'pptx', 'pdf'):
+            struct_data, plain_text = extract(filepath, file_type)
+        else:
+            plain_text = ''
+
+        if plain_text:
+            return _text_to_pdf(plain_text, tmpdir,
+                                title=os.path.basename(filepath))
+    except Exception:
+        pass
+
+    # Last resort: copy original
     ext = os.path.splitext(filepath)[1]
     out_path = os.path.join(tmpdir, f'changes{ext}')
     shutil.copy2(filepath, out_path)
+    return out_path
+
+
+def _text_to_pdf(text, tmpdir, title='Dokument'):
+    """Convert plain text to a PDF using reportlab."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.units import mm
+    from html import escape
+
+    out_path = os.path.join(tmpdir, 'export.pdf')
+    doc = SimpleDocTemplate(out_path, pagesize=A4,
+                            leftMargin=20*mm, rightMargin=20*mm,
+                            topMargin=20*mm, bottomMargin=20*mm)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('DocTitle', parent=styles['Title'], fontSize=14)
+    body_style = ParagraphStyle('DocBody', parent=styles['Normal'],
+                                 fontSize=9, leading=12,
+                                 fontName='Helvetica')
+
+    story = [Paragraph(escape(title), title_style), Spacer(1, 5*mm)]
+
+    for line in text.split('\n'):
+        safe = escape(line) if line.strip() else '&nbsp;'
+        story.append(Paragraph(safe, body_style))
+
+    doc.build(story)
     return out_path
