@@ -2,11 +2,14 @@
 import os
 import uuid
 from flask import Blueprint, request, jsonify, send_from_directory
+from werkzeug.utils import secure_filename
 from .models import SessionLocal, Document, Version, STORAGE_DIR
 from .extractors import extract
 from .diff_engine import compute_diff
 
 api = Blueprint('api', __name__, url_prefix='/api')
+
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
 def get_file_type(filename):
@@ -40,6 +43,13 @@ def create_document():
     if not file_type:
         return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF'}), 400
 
+    # Check file size
+    file.seek(0, 2)
+    size = file.tell()
+    file.seek(0)
+    if size > MAX_FILE_SIZE:
+        return jsonify({'error': f'Datei zu groß. Maximum: {MAX_FILE_SIZE // (1024*1024)} MB'}), 400
+
     document_id = request.form.get('document_id')
     label = request.form.get('label', '')
 
@@ -64,17 +74,21 @@ def create_document():
                 max_version = v.version_number
         new_version_num = max_version + 1
 
-        # Save file
-        unique_name = f"{uuid.uuid4().hex}_{file.filename}"
+        # Save file with secure filename
+        safe_name = secure_filename(file.filename) or 'upload'
+        unique_name = f"{uuid.uuid4().hex}_{safe_name}"
         doc_dir = os.path.join(STORAGE_DIR, str(doc.id))
         os.makedirs(doc_dir, exist_ok=True)
         filepath = os.path.join(doc_dir, unique_name)
+        # Verify path is within storage dir (defense in depth)
+        if not os.path.realpath(filepath).startswith(os.path.realpath(STORAGE_DIR)):
+            return jsonify({'error': 'Ungültiger Dateipfad'}), 400
         file.save(filepath)
 
         version = Version(
             document_id=doc.id,
             version_number=new_version_num,
-            filename=file.filename,
+            filename=safe_name,
             filepath=filepath,
             label=label,
         )
@@ -86,7 +100,9 @@ def create_document():
         return jsonify(doc.to_dict()), 201
     except Exception as e:
         session.rollback()
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': 'Upload fehlgeschlagen. Bitte prüfen Sie die Datei.'}), 500
     finally:
         session.close()
 
@@ -165,7 +181,7 @@ def diff_versions(doc_id, version_a, version_b):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Vergleich fehlgeschlagen. Bitte prüfen Sie die Dateien.'}), 500
     finally:
         session.close()
 
@@ -182,3 +198,194 @@ def download_version(doc_id, ver_id):
         return send_from_directory(directory, filename, as_attachment=True, download_name=version.filename)
     finally:
         session.close()
+
+
+@api.route('/export-changes/<int:doc_id>/<int:version_a>/<int:version_b>', methods=['GET'])
+def export_changed_pages(doc_id, version_a, version_b):
+    """
+    Export only the changed pages/sections as original format or PDF.
+    Query param: format=original|pdf
+    """
+    import tempfile
+    import shutil
+    import subprocess
+
+    output_format = request.args.get('format', 'original')
+    if output_format not in ('original', 'pdf'):
+        return jsonify({'error': 'Format muss "original" oder "pdf" sein'}), 400
+
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        if not doc:
+            return jsonify({'error': 'Dokument nicht gefunden'}), 404
+
+        ver_a = session.query(Version).filter_by(document_id=doc_id, version_number=version_a).first()
+        ver_b = session.query(Version).filter_by(document_id=doc_id, version_number=version_b).first()
+        if not ver_a or not ver_b:
+            return jsonify({'error': 'Version nicht gefunden'}), 404
+
+        struct_a, text_a = extract(ver_a.filepath, doc.file_type)
+        struct_b, text_b = extract(ver_b.filepath, doc.file_type)
+        diff_result = compute_diff(struct_a, text_a, struct_b, text_b, doc.file_type)
+
+        # Determine which pages/sections changed
+        changed_pages = set()
+        for change in diff_result['structural_changes']:
+            loc = change.get('location', '')
+            # Extract page/slide/section numbers
+            import re
+            nums = re.findall(r'\d+', loc)
+            if nums:
+                changed_pages.add(int(nums[0]))
+            # For items with page info
+            for items_key in ('old_items', 'new_items'):
+                for item in change.get(items_key, []):
+                    if 'page' in item:
+                        changed_pages.add(item['page'])
+                    elif 'slide' in item:
+                        changed_pages.add(item['slide'])
+
+        # For plaintext changes, map line numbers to pages
+        lines_per_page_a = {}
+        line_num = 0
+        for item in struct_a:
+            page = item.get('page') or item.get('slide') or item.get('index', 0) + 1
+            text = item.get('text', '')
+            for _ in text.split('\n'):
+                lines_per_page_a[line_num] = page
+                line_num += 1
+
+        for change in diff_result['plaintext_changes']:
+            for line_idx in range(change.get('old_start', 0), change.get('old_end', 0)):
+                if line_idx in lines_per_page_a:
+                    changed_pages.add(lines_per_page_a[line_idx])
+
+        if not changed_pages:
+            return jsonify({'error': 'Keine geänderten Seiten gefunden'}), 404
+
+        changed_pages = sorted(changed_pages)
+
+        # Generate export based on file type
+        tmpdir = tempfile.mkdtemp()
+        try:
+            if doc.file_type == 'pdf':
+                export_path = _export_pdf_pages(ver_b.filepath, changed_pages, tmpdir, output_format)
+            elif doc.file_type == 'docx':
+                export_path = _export_docx_pages(ver_b.filepath, changed_pages, tmpdir, output_format)
+            elif doc.file_type == 'xlsx':
+                export_path = _export_xlsx_sheets(ver_b.filepath, changed_pages, tmpdir, output_format, struct_b)
+            elif doc.file_type == 'pptx':
+                export_path = _export_pptx_slides(ver_b.filepath, changed_pages, tmpdir, output_format)
+            else:
+                return jsonify({'error': 'Export nicht unterstützt'}), 400
+
+            if not export_path or not os.path.exists(export_path):
+                return jsonify({'error': 'Export fehlgeschlagen'}), 500
+
+            dl_name = f"{doc.name}_Aenderungen_V{version_a}_vs_V{version_b}{os.path.splitext(export_path)[1]}"
+            return send_from_directory(
+                os.path.dirname(export_path),
+                os.path.basename(export_path),
+                as_attachment=True,
+                download_name=dl_name,
+            )
+        finally:
+            # Clean up after a delay (let the response finish)
+            import threading
+            def cleanup():
+                import time
+                time.sleep(10)
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            threading.Thread(target=cleanup, daemon=True).start()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+def _export_pdf_pages(filepath, pages, tmpdir, output_format):
+    """Extract specific pages from a PDF."""
+    from PyPDF2 import PdfReader, PdfWriter
+    reader = PdfReader(filepath)
+    writer = PdfWriter()
+
+    for page_num in pages:
+        idx = page_num - 1  # 0-indexed
+        if 0 <= idx < len(reader.pages):
+            writer.add_page(reader.pages[idx])
+
+    out_path = os.path.join(tmpdir, 'changes.pdf')
+    with open(out_path, 'wb') as f:
+        writer.write(f)
+    return out_path
+
+
+def _export_docx_pages(filepath, pages, tmpdir, output_format):
+    """
+    Export the full DOCX (version B) — DOCX doesn't have discrete "pages" at file level.
+    For PDF output, attempt LibreOffice conversion.
+    """
+    import shutil
+    if output_format == 'original':
+        out_path = os.path.join(tmpdir, 'changes.docx')
+        shutil.copy2(filepath, out_path)
+        return out_path
+    else:
+        return _convert_to_pdf(filepath, tmpdir)
+
+
+def _export_xlsx_sheets(filepath, pages, tmpdir, output_format, struct_b):
+    """Export changed sheets from an XLSX file."""
+    from openpyxl import load_workbook
+    import shutil
+
+    if output_format == 'original':
+        out_path = os.path.join(tmpdir, 'changes.xlsx')
+        shutil.copy2(filepath, out_path)
+        return out_path
+    else:
+        return _convert_to_pdf(filepath, tmpdir)
+
+
+def _export_pptx_slides(filepath, slides, tmpdir, output_format):
+    """Export changed slides from a PPTX."""
+    import shutil
+
+    if output_format == 'original':
+        out_path = os.path.join(tmpdir, 'changes.pptx')
+        shutil.copy2(filepath, out_path)
+        return out_path
+    else:
+        return _convert_to_pdf(filepath, tmpdir)
+
+
+def _convert_to_pdf(filepath, tmpdir):
+    """Convert a file to PDF using LibreOffice if available, else return None."""
+    import subprocess
+    import shutil
+
+    # Try LibreOffice
+    for lo_cmd in ['libreoffice', 'soffice', '/usr/bin/libreoffice']:
+        if shutil.which(lo_cmd):
+            try:
+                subprocess.run(
+                    [lo_cmd, '--headless', '--convert-to', 'pdf', '--outdir', tmpdir, filepath],
+                    timeout=60, check=True, capture_output=True,
+                )
+                # Find the output PDF
+                base = os.path.splitext(os.path.basename(filepath))[0]
+                pdf_path = os.path.join(tmpdir, f'{base}.pdf')
+                if os.path.exists(pdf_path):
+                    return pdf_path
+            except Exception:
+                pass
+
+    # Fallback: copy original and inform
+    ext = os.path.splitext(filepath)[1]
+    out_path = os.path.join(tmpdir, f'changes{ext}')
+    shutil.copy2(filepath, out_path)
+    return out_path

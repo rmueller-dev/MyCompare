@@ -1,77 +1,380 @@
 """
 Text extraction for all supported file types.
-Each extractor returns structured text and plain text for diff and verification.
+Each extractor returns structured data (with formatting), plain text, and formatting metadata.
 """
 import os
 import re
+from html import escape
+
+
+def _color_to_hex(color):
+    """Convert various color objects to hex string."""
+    if color is None:
+        return None
+    # python-docx RGBColor
+    if hasattr(color, 'rgb') and color.rgb:
+        return f'#{color.rgb}'
+    if hasattr(color, 'theme_color'):
+        return None  # theme colors need mapping, skip
+    if isinstance(color, str) and len(color) == 6:
+        return f'#{color}'
+    return str(color) if color else None
+
+
+def _emu_to_pt(emu):
+    """Convert EMUs to points."""
+    if emu is None:
+        return None
+    return round(emu / 12700, 1)
+
+
+def _runs_to_html(runs):
+    """Convert a list of runs (with formatting) to HTML with inline styles."""
+    parts = []
+    for run in runs:
+        text = escape(run.text or '')
+        if not text:
+            continue
+        styles = []
+        if run.bold:
+            styles.append('font-weight:bold')
+        if run.italic:
+            styles.append('font-style:italic')
+        if run.underline:
+            styles.append('text-decoration:underline')
+        if hasattr(run, 'font'):
+            font = run.font
+            if font.strike:
+                styles.append('text-decoration:line-through')
+            if font.size:
+                pt = _emu_to_pt(font.size)
+                if pt:
+                    styles.append(f'font-size:{pt}pt')
+            if font.name:
+                styles.append(f'font-family:{escape(font.name)}')
+            color = font.color
+            if color and color.rgb:
+                styles.append(f'color:#{color.rgb}')
+            if font.superscript:
+                styles.append('vertical-align:super;font-size:smaller')
+            if font.subscript:
+                styles.append('vertical-align:sub;font-size:smaller')
+
+        if styles:
+            parts.append(f'<span style="{";".join(styles)}">{text}</span>')
+        else:
+            parts.append(text)
+    return ''.join(parts)
+
+
+def _runs_to_formatting(runs):
+    """Extract formatting metadata from runs for diff comparison."""
+    fmt_parts = []
+    for run in runs:
+        text = run.text or ''
+        if not text:
+            continue
+        fmt = {
+            'text': text,
+            'bold': bool(run.bold),
+            'italic': bool(run.italic),
+            'underline': bool(run.underline),
+        }
+        if hasattr(run, 'font'):
+            font = run.font
+            fmt['strike'] = bool(font.strike)
+            fmt['size'] = _emu_to_pt(font.size)
+            fmt['font_name'] = font.name
+            fmt['color'] = f'#{font.color.rgb}' if font.color and font.color.rgb else None
+            fmt['superscript'] = bool(font.superscript)
+            fmt['subscript'] = bool(font.subscript)
+        fmt_parts.append(fmt)
+    return fmt_parts
+
+
+def _para_alignment_str(alignment):
+    """Convert paragraph alignment to string."""
+    if alignment is None:
+        return None
+    mapping = {0: 'left', 1: 'center', 2: 'right', 3: 'justify'}
+    return mapping.get(int(alignment), str(alignment))
+
+
+def _extract_xml_fields(para_element):
+    """
+    Extract field codes from paragraph XML (auto-numbering, cross-references, TOC, etc.).
+    These are stored as w:fldChar / w:instrText in the XML, not visible via python-docx API.
+    """
+    from lxml import etree
+    nsmap = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    fields = []
+
+    # Simple fields (w:fldSimple)
+    for fld in para_element.findall('.//w:fldSimple', nsmap):
+        instr = fld.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}instr', '')
+        display = ''.join(t.text or '' for t in fld.findall('.//w:t', nsmap))
+        if instr.strip():
+            fields.append({'instruction': instr.strip(), 'display': display})
+
+    # Complex fields (w:fldChar begin...w:instrText...w:fldChar end)
+    in_field = False
+    current_instr = []
+    current_display = []
+    for child in para_element.iter():
+        tag = etree.QName(child.tag).localname if '}' in child.tag else child.tag
+        if tag == 'fldChar':
+            fld_type = child.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fldCharType', '')
+            if fld_type == 'begin':
+                in_field = True
+                current_instr = []
+                current_display = []
+            elif fld_type == 'separate':
+                pass  # after this comes display text
+            elif fld_type == 'end':
+                if current_instr:
+                    fields.append({
+                        'instruction': ' '.join(current_instr).strip(),
+                        'display': ''.join(current_display),
+                    })
+                in_field = False
+                current_instr = []
+                current_display = []
+        elif tag == 'instrText' and in_field:
+            current_instr.append(child.text or '')
+        elif tag == 't' and in_field:
+            current_display.append(child.text or '')
+
+    return fields
+
+
+def _extract_numbering_info(para, doc):
+    """Extract auto-numbering information from paragraph."""
+    try:
+        pPr = para._element.find(
+            '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pPr'
+        )
+        if pPr is None:
+            return None
+        numPr = pPr.find(
+            '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numPr'
+        )
+        if numPr is None:
+            return None
+        ilvl = numPr.find(
+            '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}ilvl'
+        )
+        numId = numPr.find(
+            '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numId'
+        )
+        level = ilvl.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val') if ilvl is not None else '0'
+        num_id = numId.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val') if numId is not None else None
+
+        return {
+            'numId': num_id,
+            'level': int(level) if level else 0,
+        }
+    except Exception:
+        return None
+
+
+def _extract_bookmarks(para_element):
+    """Extract bookmarks from paragraph XML."""
+    nsmap = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    bookmarks = []
+    for bm in para_element.findall('.//w:bookmarkStart', nsmap):
+        name = bm.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}name', '')
+        if name and not name.startswith('_'):  # Skip internal bookmarks
+            bookmarks.append(name)
+    return bookmarks
 
 
 def extract_docx(filepath):
-    """Extract text from DOCX files - paragraph-level structure."""
+    """Extract text with formatting, fields, numbering, cross-refs, TOC from DOCX files."""
     from docx import Document
     doc = Document(filepath)
     paragraphs = []
     plain_parts = []
 
-    for i, para in enumerate(doc.paragraphs):
+    def process_para(para, context=''):
         text = para.text
-        paragraphs.append({
-            'index': i,
-            'text': text,
-            'style': para.style.name if para.style else '',
-        })
-        plain_parts.append(text)
+        html = _runs_to_html(para.runs)
+        formatting = _runs_to_formatting(para.runs)
+        alignment = _para_alignment_str(para.alignment)
+        style_name = para.style.name if para.style else ''
 
-    # Also extract text from tables
+        # Extract fields (cross-references, TOC entries, page numbers, auto-numbering display)
+        fields = _extract_xml_fields(para._element)
+
+        # Extract numbering info
+        numbering = _extract_numbering_info(para, doc)
+
+        # Extract bookmarks
+        bookmarks = _extract_bookmarks(para._element)
+
+        # Enrich text with field information for diff detection
+        field_text_parts = []
+        for f in fields:
+            instr = f['instruction'].upper()
+            display = f['display']
+            if 'REF' in instr:
+                field_text_parts.append(f'[Querverweis: {f["instruction"]} → "{display}"]')
+            elif 'TOC' in instr:
+                field_text_parts.append(f'[Verzeichnis: {f["instruction"]}]')
+            elif 'PAGE' in instr:
+                field_text_parts.append(f'[Seitenzahl: {display}]')
+            elif 'SEQ' in instr:
+                field_text_parts.append(f'[Nummerierung: {f["instruction"]} → "{display}"]')
+            elif 'HYPERLINK' in instr:
+                field_text_parts.append(f'[Link: {f["instruction"]}]')
+            else:
+                field_text_parts.append(f'[Feld: {f["instruction"]} → "{display}"]')
+
+        # Add numbering prefix to HTML for visual display
+        num_prefix = ''
+        if numbering:
+            num_prefix = f'<span style="color:#666;margin-right:4px">[Ebene {numbering["level"]}]</span>'
+
+        # Add field annotations to HTML
+        field_html = ''
+        if fields:
+            field_tags = ' '.join(
+                f'<span style="background:#e0e7ff;color:#3730a3;font-size:0.75em;padding:1px 4px;border-radius:3px;margin-left:2px">{escape(ft)}</span>'
+                for ft in field_text_parts
+            )
+            field_html = f' {field_tags}'
+
+        # Wrap html in alignment div if needed
+        full_html = f'{num_prefix}{html}{field_html}'
+        if alignment and alignment != 'left':
+            full_html = f'<div style="text-align:{alignment}">{full_html}</div>'
+
+        # Build enriched plain text for comparison (includes field info)
+        enriched_text = text
+        if field_text_parts:
+            enriched_text = text + ' ' + ' '.join(field_text_parts)
+
+        entry = {
+            'index': len(paragraphs),
+            'text': text,
+            'enriched_text': enriched_text,
+            'html': full_html,
+            'formatting': formatting,
+            'alignment': alignment,
+            'style': style_name,
+            'context': context,
+            'fields': fields,
+            'numbering': numbering,
+            'bookmarks': bookmarks,
+        }
+        paragraphs.append(entry)
+        # Use enriched text for plain text so field changes are detected by Engine B
+        plain_parts.append(enriched_text)
+
+    for para in doc.paragraphs:
+        process_para(para, 'body')
+
+    # Tables
     for table_idx, table in enumerate(doc.tables):
         for row_idx, row in enumerate(table.rows):
             for cell_idx, cell in enumerate(row.cells):
-                cell_text = cell.text.strip()
-                if cell_text:
-                    paragraphs.append({
-                        'index': len(paragraphs),
-                        'text': cell_text,
-                        'style': f'Table[{table_idx}].Row[{row_idx}].Cell[{cell_idx}]',
-                    })
-                    plain_parts.append(cell_text)
+                for para in cell.paragraphs:
+                    if para.text.strip():
+                        process_para(para, f'Table[{table_idx}].Row[{row_idx}].Cell[{cell_idx}]')
 
-    # Extract from headers and footers
+    # Headers and footers
     for section in doc.sections:
-        for header_footer in [section.header, section.footer]:
-            if header_footer and header_footer.paragraphs:
-                for para in header_footer.paragraphs:
-                    text = para.text.strip()
-                    if text:
-                        paragraphs.append({
-                            'index': len(paragraphs),
-                            'text': text,
-                            'style': 'Header/Footer',
-                        })
-                        plain_parts.append(text)
+        for hf_name, hf in [('Header', section.header), ('Footer', section.footer)]:
+            if hf and hf.paragraphs:
+                for para in hf.paragraphs:
+                    if para.text.strip():
+                        process_para(para, hf_name)
 
     plain_text = '\n'.join(plain_parts)
     return paragraphs, plain_text
 
 
 def extract_xlsx(filepath):
-    """Extract text from XLSX files - cell-level structure."""
+    """Extract text with formatting from XLSX files."""
     from openpyxl import load_workbook
-    wb = load_workbook(filepath, data_only=True)
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = load_workbook(filepath, data_only=False)
+    wb_data = load_workbook(filepath, data_only=True)
     cells = []
     plain_parts = []
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
+        ws_data = wb_data[sheet_name]
         for row in ws.iter_rows():
             for cell in row:
                 val = cell.value
-                if val is not None:
-                    text = str(val)
+                # Also get computed value from data_only workbook
+                data_cell = ws_data[cell.coordinate]
+                display_val = data_cell.value if data_cell.value is not None else val
+
+                if val is not None or display_val is not None:
+                    text = str(display_val if display_val is not None else val)
                     coord = f"{sheet_name}!{cell.coordinate}"
+
+                    # Extract formatting
+                    fmt = {}
+                    font = cell.font
+                    if font:
+                        fmt['bold'] = bool(font.bold)
+                        fmt['italic'] = bool(font.italic)
+                        fmt['underline'] = font.underline if font.underline and font.underline != 'none' else None
+                        fmt['strike'] = bool(font.strikethrough)
+                        fmt['font_name'] = font.name
+                        fmt['font_size'] = font.size
+                        if font.color and font.color.rgb and str(font.color.rgb) != '00000000':
+                            fmt['color'] = f'#{font.color.rgb}'
+                        else:
+                            fmt['color'] = None
+
+                    fill = cell.fill
+                    if fill and fill.fgColor and fill.fgColor.rgb and str(fill.fgColor.rgb) not in ('00000000', '0'):
+                        fmt['bg_color'] = f'#{fill.fgColor.rgb}'
+                    else:
+                        fmt['bg_color'] = None
+
+                    alignment = cell.alignment
+                    if alignment:
+                        fmt['align'] = alignment.horizontal
+                    fmt['number_format'] = cell.number_format if cell.number_format != 'General' else None
+
+                    # Build HTML
+                    styles = []
+                    if fmt.get('bold'):
+                        styles.append('font-weight:bold')
+                    if fmt.get('italic'):
+                        styles.append('font-style:italic')
+                    if fmt.get('underline'):
+                        styles.append('text-decoration:underline')
+                    if fmt.get('strike'):
+                        styles.append('text-decoration:line-through')
+                    if fmt.get('font_name'):
+                        styles.append(f'font-family:{escape(fmt["font_name"])}')
+                    if fmt.get('font_size'):
+                        styles.append(f'font-size:{fmt["font_size"]}pt')
+                    if fmt.get('color'):
+                        styles.append(f'color:{fmt["color"]}')
+                    if fmt.get('bg_color'):
+                        styles.append(f'background-color:{fmt["bg_color"]}')
+
+                    html = f'<span style="{";".join(styles)}">{escape(text)}</span>' if styles else escape(text)
+
+                    # Serialize formatting for comparison
+                    fmt_key = ';'.join(f'{k}={v}' for k, v in sorted(fmt.items()) if v)
+
                     cells.append({
                         'coord': coord,
                         'text': text,
+                        'html': html,
+                        'formatting': fmt,
+                        'formatting_key': fmt_key,
                         'sheet': sheet_name,
+                        'formula': str(val) if isinstance(val, str) and val.startswith('=') else None,
                     })
                     plain_parts.append(f"{coord}={text}")
 
@@ -80,8 +383,10 @@ def extract_xlsx(filepath):
 
 
 def extract_pptx(filepath):
-    """Extract text from PPTX files - shape-level structure."""
+    """Extract text with formatting from PPTX files."""
     from pptx import Presentation
+    from pptx.util import Pt, Emu
+
     prs = Presentation(filepath)
     elements = []
     plain_parts = []
@@ -91,26 +396,111 @@ def extract_pptx(filepath):
             if shape.has_text_frame:
                 for para in shape.text_frame.paragraphs:
                     text = para.text
-                    if text.strip():
-                        elements.append({
-                            'slide': slide_idx,
-                            'shape': shape.name,
-                            'text': text,
-                        })
-                        plain_parts.append(f"Slide{slide_idx}.{shape.name}: {text}")
+                    if not text.strip():
+                        continue
+
+                    # Build HTML from runs
+                    html_parts = []
+                    fmt_parts = []
+                    for run in para.runs:
+                        run_text = run.text or ''
+                        if not run_text:
+                            continue
+                        styles = []
+                        fmt = {'text': run_text}
+
+                        font = run.font
+                        if font.bold:
+                            styles.append('font-weight:bold')
+                            fmt['bold'] = True
+                        if font.italic:
+                            styles.append('font-style:italic')
+                            fmt['italic'] = True
+                        if font.underline:
+                            styles.append('text-decoration:underline')
+                            fmt['underline'] = True
+                        if font.size:
+                            pt = _emu_to_pt(font.size)
+                            if pt:
+                                styles.append(f'font-size:{pt}pt')
+                                fmt['size'] = pt
+                        if font.name:
+                            styles.append(f'font-family:{escape(font.name)}')
+                            fmt['font_name'] = font.name
+                        if font.color and font.color.rgb:
+                            styles.append(f'color:#{font.color.rgb}')
+                            fmt['color'] = f'#{font.color.rgb}'
+
+                        if styles:
+                            html_parts.append(f'<span style="{";".join(styles)}">{escape(run_text)}</span>')
+                        else:
+                            html_parts.append(escape(run_text))
+                        fmt_parts.append(fmt)
+
+                    # Paragraph alignment
+                    alignment = None
+                    if para.alignment is not None:
+                        align_map = {0: 'left', 1: 'center', 2: 'right', 3: 'justify'}
+                        alignment = align_map.get(int(para.alignment))
+
+                    html = ''.join(html_parts)
+                    if alignment and alignment != 'left':
+                        html = f'<div style="text-align:{alignment}">{html}</div>'
+
+                    elements.append({
+                        'slide': slide_idx,
+                        'shape': shape.name,
+                        'text': text,
+                        'html': html,
+                        'formatting': fmt_parts,
+                        'alignment': alignment,
+                    })
+                    plain_parts.append(f"Slide{slide_idx}.{shape.name}: {text}")
+
             if shape.has_table:
                 table = shape.table
                 for row_idx, row in enumerate(table.rows):
                     for col_idx, cell in enumerate(row.cells):
                         text = cell.text.strip()
                         if text:
+                            # Extract formatting from cell paragraphs
+                            cell_html_parts = []
+                            cell_fmt = []
+                            for para in cell.text_frame.paragraphs:
+                                for run in para.runs:
+                                    run_text = run.text or ''
+                                    if not run_text:
+                                        continue
+                                    styles = []
+                                    fmt = {'text': run_text}
+                                    font = run.font
+                                    if font.bold:
+                                        styles.append('font-weight:bold')
+                                        fmt['bold'] = True
+                                    if font.italic:
+                                        styles.append('font-style:italic')
+                                        fmt['italic'] = True
+                                    if font.size:
+                                        pt = _emu_to_pt(font.size)
+                                        if pt:
+                                            styles.append(f'font-size:{pt}pt')
+                                            fmt['size'] = pt
+                                    if styles:
+                                        cell_html_parts.append(f'<span style="{";".join(styles)}">{escape(run_text)}</span>')
+                                    else:
+                                        cell_html_parts.append(escape(run_text))
+                                    cell_fmt.append(fmt)
+
                             elements.append({
                                 'slide': slide_idx,
                                 'shape': f'{shape.name}.Table[{row_idx},{col_idx}]',
                                 'text': text,
+                                'html': ''.join(cell_html_parts) or escape(text),
+                                'formatting': cell_fmt,
                             })
                             plain_parts.append(f"Slide{slide_idx}.{shape.name}[{row_idx},{col_idx}]: {text}")
-        # Also extract notes
+
+        # Notes
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
             for para in slide.notes_slide.notes_text_frame.paragraphs:
                 text = para.text.strip()
@@ -119,6 +509,8 @@ def extract_pptx(filepath):
                         'slide': slide_idx,
                         'shape': 'Notes',
                         'text': text,
+                        'html': escape(text),
+                        'formatting': [{'text': text}],
                     })
                     plain_parts.append(f"Slide{slide_idx}.Notes: {text}")
 
@@ -127,7 +519,7 @@ def extract_pptx(filepath):
 
 
 def extract_pdf(filepath):
-    """Extract text from PDF files using pdfplumber for accuracy."""
+    """Extract text from PDF files using pdfplumber with font info."""
     import pdfplumber
     pages = []
     plain_parts = []
@@ -135,13 +527,31 @@ def extract_pdf(filepath):
     with pdfplumber.open(filepath) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
             text = page.extract_text() or ''
+
+            # Extract character-level font info for formatting detection
+            chars = page.chars or []
+            font_info = {}
+            for char in chars:
+                font_name = char.get('fontname', '')
+                font_size = round(char.get('size', 0), 1)
+                key = f"{font_name}@{font_size}"
+                font_info[key] = font_info.get(key, 0) + 1
+
+            # Build HTML with basic font info annotations
+            html_lines = []
+            for line in text.split('\n'):
+                html_lines.append(escape(line))
+            html = '<br>'.join(html_lines)
+
             pages.append({
                 'page': page_num,
                 'text': text,
+                'html': html,
+                'font_info': font_info,
             })
             plain_parts.append(text)
 
-            # Also extract table data
+            # Tables
             tables = page.extract_tables()
             for t_idx, table in enumerate(tables):
                 for row in table:
@@ -149,6 +559,8 @@ def extract_pdf(filepath):
                     pages.append({
                         'page': page_num,
                         'text': f'[Table {t_idx + 1}] {row_text}',
+                        'html': f'<em>[Tabelle {t_idx + 1}]</em> {escape(row_text)}',
+                        'font_info': {},
                     })
                     plain_parts.append(row_text)
 

@@ -1,6 +1,17 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import DOMPurify from 'dompurify';
 
 const API = '/api';
+
+// Configure DOMPurify to allow safe inline styles
+DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
+  if (data.attrName === 'style') {
+    // Only allow safe CSS properties for formatting display
+    const allowed = /^(font-weight|font-style|font-size|font-family|text-decoration|text-align|color|background-color|vertical-align|margin-right|padding|border-radius):/;
+    const parts = data.attrValue.split(';').filter(p => allowed.test(p.trim()));
+    data.attrValue = parts.join(';');
+  }
+});
 
 // ─── FILE TYPE ICONS & LABELS ───
 const FILE_TYPE_META = {
@@ -9,6 +20,16 @@ const FILE_TYPE_META = {
   pptx: { label: 'PowerPoint', color: 'bg-orange-100 text-orange-800', icon: 'P' },
   pdf:  { label: 'PDF', color: 'bg-red-100 text-red-800', icon: 'PDF' },
 };
+
+// ─── SAFE HTML RENDER (sanitized with DOMPurify) ───
+function FormattedText({ html, fallback }) {
+  if (!html) return <>{fallback || ''}</>;
+  const clean = DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: ['span', 'div', 'br', 'em', 'b', 'i', 'u', 's', 'strong', 'sub', 'sup'],
+    ALLOWED_ATTR: ['style'],
+  });
+  return <span dangerouslySetInnerHTML={{ __html: clean }} />;
+}
 
 // ─── VERIFICATION BADGE ───
 function VerificationBadge({ verification }) {
@@ -39,29 +60,105 @@ function VerificationBadge({ verification }) {
   );
 }
 
+// ─── VIEW MODE TOGGLE ───
+function ViewModeToggle({ mode, setMode }) {
+  return (
+    <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
+      {[['formatted', 'Formatiert'], ['plain', 'Nur Text']].map(([val, label]) => (
+        <button key={val} onClick={() => setMode(val)}
+          className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+            mode === val ? 'bg-white shadow text-gray-800' : 'text-gray-500 hover:text-gray-700'
+          }`}>{label}</button>
+      ))}
+    </div>
+  );
+}
+
+// ─── EXPORT BUTTON ───
+function ExportButton({ docId, versionA, versionB }) {
+  const [open, setOpen] = useState(false);
+
+  if (!docId || !versionA || !versionB) return null;
+
+  const doExport = (fmt) => {
+    window.open(`${API}/export-changes/${docId}/${versionA}/${versionB}?format=${fmt}`, '_blank');
+    setOpen(false);
+  };
+
+  return (
+    <div className="relative inline-block">
+      <button onClick={() => setOpen(!open)}
+        className="bg-gray-100 text-gray-700 px-3 py-1.5 rounded text-sm font-medium hover:bg-gray-200 transition-colors">
+        Änderungen exportieren
+      </button>
+      {open && (
+        <div className="absolute right-0 mt-1 bg-white border rounded-lg shadow-lg z-10 py-1 w-48">
+          <button onClick={() => doExport('original')}
+            className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50">
+            Originalformat herunterladen
+          </button>
+          <button onClick={() => doExport('pdf')}
+            className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50">
+            Als PDF herunterladen
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── UNIFIED DIFF VIEW ───
 function DiffView({ diffResult }) {
+  const [viewMode, setViewMode] = useState('formatted');
+
   if (!diffResult) return null;
   const { unified_lines, structural_changes, summary, verification } = diffResult;
+
+  const formattingChanges = structural_changes?.filter(c => c.type === 'formatting') || [];
+  const contentChanges = structural_changes?.filter(c => c.type !== 'formatting') || [];
 
   return (
     <div>
       <VerificationBadge verification={verification} />
 
-      <div className="mb-4 flex gap-4 text-sm text-gray-600">
-        <span>Strukturelle Änderungen: <b>{summary?.structural_count}</b></span>
+      <div className="mb-4 flex flex-wrap items-center gap-4 text-sm text-gray-600">
+        <span>Inhaltsänderungen: <b>{contentChanges.length}</b></span>
+        <span>Formatierungsänderungen: <b>{summary?.formatting_count || 0}</b></span>
         <span>Plaintext-Änderungen: <b>{summary?.plaintext_count}</b></span>
         <span>Zeilen alt: <b>{summary?.total_lines_a}</b></span>
         <span>Zeilen neu: <b>{summary?.total_lines_b}</b></span>
+        <div className="ml-auto flex gap-2 items-center">
+          <ExportButton
+            docId={diffResult.document?.id}
+            versionA={diffResult.version_a?.version_number}
+            versionB={diffResult.version_b?.version_number}
+          />
+          <ViewModeToggle mode={viewMode} setMode={setViewMode} />
+        </div>
       </div>
 
-      {/* Structural changes summary */}
-      {structural_changes && structural_changes.length > 0 && (
+      {/* Formatting-only changes */}
+      {formattingChanges.length > 0 && (
+        <div className="mb-4">
+          <h3 className="font-semibold text-gray-700 mb-2 flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-purple-500"></span>
+            Formatierungsänderungen
+          </h3>
+          <div className="space-y-2">
+            {formattingChanges.map((ch, i) => (
+              <FormattingChange key={i} change={ch} viewMode={viewMode} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Structural content changes */}
+      {contentChanges.length > 0 && (
         <div className="mb-4">
           <h3 className="font-semibold text-gray-700 mb-2">Strukturelle Änderungen</h3>
           <div className="space-y-2">
-            {structural_changes.map((ch, i) => (
-              <StructuralChange key={i} change={ch} />
+            {contentChanges.map((ch, i) => (
+              <StructuralChange key={i} change={ch} viewMode={viewMode} />
             ))}
           </div>
         </div>
@@ -76,7 +173,7 @@ function DiffView({ diffResult }) {
         </div>
         <div className="max-h-[60vh] overflow-auto">
           {unified_lines && unified_lines.map((line, i) => (
-            <DiffLine key={i} line={line} />
+            <DiffLine key={i} line={line} viewMode={viewMode} />
           ))}
           {(!unified_lines || unified_lines.length === 0) && (
             <div className="p-4 text-center text-gray-400">Keine Zeilen zum Anzeigen</div>
@@ -87,13 +184,61 @@ function DiffView({ diffResult }) {
   );
 }
 
-function StructuralChange({ change }) {
+function FormattingChange({ change, viewMode }) {
+  return (
+    <div className="border border-purple-200 rounded p-3 bg-purple-50">
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-xs px-2 py-0.5 rounded font-medium bg-purple-100 text-purple-800">
+          Formatierung
+        </span>
+        <span className="text-xs text-gray-500">{change.location}</span>
+      </div>
+      <div className="text-xs space-y-0.5 mb-2">
+        {(change.formatting_changes || []).map((fc, i) => (
+          <div key={i} className="flex items-center gap-1">
+            <span className="text-purple-600">•</span>
+            <span>{fc}</span>
+          </div>
+        ))}
+      </div>
+      {/* Show formatted preview if available */}
+      {viewMode === 'formatted' && (change.old_items || change.old_html) && (
+        <div className="flex gap-2 text-xs">
+          <div className="flex-1 bg-white p-2 rounded border">
+            <div className="text-[10px] text-gray-400 mb-1">Vorher:</div>
+            {change.old_items ? (
+              change.old_items.map((it, j) => (
+                <div key={j}><FormattedText html={it.html} fallback={it.text} /></div>
+              ))
+            ) : (
+              <FormattedText html={change.old_html} fallback={change.old_text} />
+            )}
+          </div>
+          <div className="flex-1 bg-white p-2 rounded border">
+            <div className="text-[10px] text-gray-400 mb-1">Nachher:</div>
+            {change.new_items ? (
+              change.new_items.map((it, j) => (
+                <div key={j}><FormattedText html={it.html} fallback={it.text} /></div>
+              ))
+            ) : (
+              <FormattedText html={change.new_html} fallback={change.new_text} />
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StructuralChange({ change, viewMode }) {
   const typeLabels = { replace: 'Geändert', insert: 'Eingefügt', delete: 'Gelöscht' };
   const typeColors = {
     replace: 'bg-yellow-100 text-yellow-800',
     insert: 'bg-green-100 text-green-800',
     delete: 'bg-red-100 text-red-800',
   };
+
+  const showFormatted = viewMode === 'formatted';
 
   return (
     <div className="border rounded p-3 bg-white">
@@ -102,27 +247,72 @@ function StructuralChange({ change }) {
           {typeLabels[change.type] || change.type}
         </span>
         <span className="text-xs text-gray-500">{change.location}</span>
+        {change.formatting_changes && change.formatting_changes.length > 0 && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">
+            +Formatierung
+          </span>
+        )}
       </div>
+
+      {/* Show formatting changes if any */}
+      {change.formatting_changes && change.formatting_changes.length > 0 && (
+        <div className="text-xs text-purple-700 mb-1 space-y-0.5">
+          {change.formatting_changes.map((fc, i) => (
+            <div key={i} className="flex items-center gap-1"><span>•</span><span>{fc}</span></div>
+          ))}
+        </div>
+      )}
+
       {change.old_text !== undefined && (
         <div className="flex gap-2 text-xs">
-          {change.old_text && <div className="flex-1 bg-red-50 p-1.5 rounded line-through">{change.old_text}</div>}
-          {change.new_text && <div className="flex-1 bg-green-50 p-1.5 rounded">{change.new_text}</div>}
+          {change.old_text && (
+            <div className="flex-1 bg-red-50 p-1.5 rounded">
+              {showFormatted && change.old_html ? (
+                <FormattedText html={change.old_html} fallback={change.old_text} />
+              ) : (
+                <span className="line-through">{change.old_text}</span>
+              )}
+            </div>
+          )}
+          {change.new_text && (
+            <div className="flex-1 bg-green-50 p-1.5 rounded">
+              {showFormatted && change.new_html ? (
+                <FormattedText html={change.new_html} fallback={change.new_text} />
+              ) : change.new_text}
+            </div>
+          )}
         </div>
       )}
       {change.inline_diffs && change.inline_diffs.map((d, i) => (
         <div key={i} className="flex gap-2 text-xs mt-1">
-          <div className="flex-1 bg-red-50 p-1.5 rounded">{d.old_text}</div>
-          <div className="flex-1 bg-green-50 p-1.5 rounded">{d.new_text}</div>
+          <div className="flex-1 bg-red-50 p-1.5 rounded">
+            {showFormatted && d.old_html ? (
+              <FormattedText html={d.old_html} fallback={d.old_text} />
+            ) : d.old_text}
+          </div>
+          <div className="flex-1 bg-green-50 p-1.5 rounded">
+            {showFormatted && d.new_html ? (
+              <FormattedText html={d.new_html} fallback={d.new_text} />
+            ) : d.new_text}
+          </div>
         </div>
       ))}
       {change.old_items && !change.inline_diffs && (
         <div className="flex gap-2 text-xs">
           <div className="flex-1 bg-red-50 p-1.5 rounded">
-            {change.old_items.map((it, j) => <div key={j}>{it.text}</div>)}
+            {change.old_items.map((it, j) => (
+              <div key={j}>
+                {showFormatted && it.html ? <FormattedText html={it.html} fallback={it.text} /> : it.text}
+              </div>
+            ))}
           </div>
           {change.new_items && (
             <div className="flex-1 bg-green-50 p-1.5 rounded">
-              {change.new_items.map((it, j) => <div key={j}>{it.text}</div>)}
+              {change.new_items.map((it, j) => (
+                <div key={j}>
+                  {showFormatted && it.html ? <FormattedText html={it.html} fallback={it.text} /> : it.text}
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -131,13 +321,15 @@ function StructuralChange({ change }) {
   );
 }
 
-function DiffLine({ line }) {
+function DiffLine({ line, viewMode }) {
   const bg = {
     equal: '',
     replace: 'bg-yellow-50',
     delete: 'bg-red-50',
     insert: 'bg-green-50',
   };
+
+  const showFormatted = viewMode === 'formatted';
 
   return (
     <div className={`grid grid-cols-2 border-b border-gray-100 ${bg[line.type]}`}>
@@ -148,6 +340,8 @@ function DiffLine({ line }) {
         <span className={`flex-1 px-2 py-0.5 whitespace-pre-wrap break-all ${line.type === 'delete' ? 'bg-red-100' : line.type === 'replace' ? 'bg-red-50' : ''}`}>
           {line.type === 'replace' && line.inline_diff ? (
             <InlineHighlight tokens={line.inline_diff} side="old" text={line.left_text} />
+          ) : showFormatted && line.left_html ? (
+            <FormattedText html={line.left_html} fallback={line.left_text} />
           ) : line.left_text}
         </span>
       </div>
@@ -158,6 +352,8 @@ function DiffLine({ line }) {
         <span className={`flex-1 px-2 py-0.5 whitespace-pre-wrap break-all ${line.type === 'insert' ? 'bg-green-100' : line.type === 'replace' ? 'bg-green-50' : ''}`}>
           {line.type === 'replace' && line.inline_diff ? (
             <InlineHighlight tokens={line.inline_diff} side="new" text={line.right_text} />
+          ) : showFormatted && line.right_html ? (
+            <FormattedText html={line.right_html} fallback={line.right_text} />
           ) : line.right_text}
         </span>
       </div>
@@ -168,7 +364,6 @@ function DiffLine({ line }) {
 function InlineHighlight({ tokens, side, text }) {
   if (!tokens || tokens.length === 0) return <>{text}</>;
 
-  // Reconstruct text with highlights from word-level tokens
   const parts = [];
   let i = 0;
   for (const tok of tokens) {
@@ -184,13 +379,12 @@ function InlineHighlight({ tokens, side, text }) {
       }
     }
   }
-  // If no parts were generated, just show raw text
   return parts.length > 0 ? <>{parts}</> : <>{text}</>;
 }
 
 // ─── UPLOAD MODAL ───
 function UploadModal({ onClose, onUpload, documents }) {
-  const [mode, setMode] = useState('new'); // 'new' or 'existing'
+  const [mode, setMode] = useState('new');
   const [selectedDoc, setSelectedDoc] = useState('');
   const [name, setName] = useState('');
   const [label, setLabel] = useState('');
