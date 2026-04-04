@@ -382,42 +382,135 @@ function InlineHighlight({ tokens, side, text }) {
   return parts.length > 0 ? <>{parts}</> : <>{text}</>;
 }
 
-// ─── QUICK COMPARE (2 files → instant diff) ───
-function QuickCompare({ onResult, onDocCreated }) {
+// ─── QUICK COMPARE (drop files → instant diff) ───
+function QuickCompare({ onResult, onDocCreated, documents }) {
   const [fileOld, setFileOld] = useState(null);
   const [fileNew, setFileNew] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState('');
   const [error, setError] = useState('');
   const [dragOver, setDragOver] = useState(false);
 
   const ALLOWED = ['.docx', '.xlsx', '.pptx', '.pdf'];
   const isAllowed = (name) => ALLOWED.some(ext => name.toLowerCase().endsWith(ext));
+  const getExt = (name) => name.split('.').pop().toLowerCase();
+
+  // Prevent browser from opening dropped files (must be on window level)
+  useEffect(() => {
+    const prevent = (e) => { e.preventDefault(); e.stopPropagation(); };
+    window.addEventListener('dragover', prevent);
+    window.addEventListener('drop', prevent);
+    return () => {
+      window.removeEventListener('dragover', prevent);
+      window.removeEventListener('drop', prevent);
+    };
+  }, []);
+
+  // Find existing document that matches a filename + type
+  const findExistingDoc = (filename) => {
+    if (!documents || documents.length === 0) return null;
+    const ext = getExt(filename);
+    const baseName = filename.replace(/\.[^.]+$/, '').toLowerCase();
+    // Look for a document with same type and similar name
+    for (const doc of documents) {
+      if (doc.file_type !== ext) continue;
+      const docBase = doc.name.toLowerCase();
+      // Match if names overlap or if any version has a matching filename
+      if (docBase.includes(baseName) || baseName.includes(docBase)) return doc;
+      for (const v of (doc.versions || [])) {
+        const vBase = v.filename.replace(/\.[^.]+$/, '').toLowerCase();
+        if (vBase === baseName || vBase.includes(baseName) || baseName.includes(vBase)) return doc;
+      }
+    }
+    return null;
+  };
 
   const handleFiles = (files) => {
     const valid = Array.from(files).filter(f => isAllowed(f.name));
-    if (valid.length < 2) {
-      if (valid.length === 1 && !fileOld) {
-        setFileOld(valid[0]);
-        setError('');
-      } else if (valid.length === 1 && fileOld) {
-        setFileNew(valid[0]);
-        setError('');
-      } else {
-        setError('Bitte zwei Dateien gleichen Typs auswählen (DOCX, XLSX, PPTX oder PDF)');
-      }
+    if (valid.length === 0) {
+      setError('Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF');
       return;
     }
-    // Sort by lastModified — older first
-    valid.sort((a, b) => (a.lastModified || 0) - (b.lastModified || 0));
-    setFileOld(valid[0]);
-    setFileNew(valid[1]);
     setError('');
+
+    if (valid.length >= 2) {
+      // Two files: sort by lastModified — older first
+      valid.sort((a, b) => (a.lastModified || 0) - (b.lastModified || 0));
+      setFileOld(valid[0]);
+      setFileNew(valid[1]);
+    } else if (valid.length === 1) {
+      // One file: check if there's an existing version to compare against
+      const file = valid[0];
+      const existingDoc = findExistingDoc(file.name);
+
+      if (existingDoc && existingDoc.versions && existingDoc.versions.length > 0) {
+        // Auto-upload as new version and diff against latest
+        autoUploadAndDiff(file, existingDoc);
+      } else if (!fileOld) {
+        setFileOld(file);
+        setStatus('Erste Datei geladen. Jetzt die zweite Datei hinzufügen, oder einfach noch eine reinziehen.');
+      } else {
+        setFileNew(file);
+        setStatus('');
+      }
+    }
+  };
+
+  // Upload single file as new version to existing doc, then auto-diff
+  const autoUploadAndDiff = async (file, existingDoc) => {
+    setLoading(true);
+    setStatus(`Vorversion gefunden: "${existingDoc.name}" — lade als neue Version hoch und vergleiche...`);
+    setError('');
+    try {
+      // Upload as new version
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('document_id', String(existingDoc.id));
+      formData.append('label', 'Neue Version (automatisch)');
+      const uploadRes = await fetch(`${API}/documents`, { method: 'POST', body: formData });
+      const uploadData = await uploadRes.json();
+      if (!uploadRes.ok) throw new Error(uploadData.error || 'Upload fehlgeschlagen');
+
+      // Get the last two versions
+      const versions = uploadData.versions || [];
+      if (versions.length < 2) throw new Error('Nicht genug Versionen für Vergleich');
+      const verOld = versions[versions.length - 2];
+      const verNew = versions[versions.length - 1];
+
+      // Run diff
+      const diffRes = await fetch(`${API}/diff/${existingDoc.id}/${verOld.version_number}/${verNew.version_number}`);
+      const diffData = await diffRes.json();
+      if (!diffRes.ok) throw new Error(diffData.error || 'Vergleich fehlgeschlagen');
+
+      onResult(diffData);
+      if (onDocCreated) onDocCreated();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+      setStatus('');
+    }
   };
 
   const handleDrop = (e) => {
     e.preventDefault();
+    e.stopPropagation();
     setDragOver(false);
-    handleFiles(e.dataTransfer.files);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleFiles(e.dataTransfer.files);
+    }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
   };
 
   const swap = () => {
@@ -429,6 +522,7 @@ function QuickCompare({ onResult, onDocCreated }) {
   const runCompare = async () => {
     if (!fileOld || !fileNew) return;
     setLoading(true);
+    setStatus('Vergleich läuft...');
     setError('');
     const formData = new FormData();
     formData.append('file_old', fileOld);
@@ -443,6 +537,7 @@ function QuickCompare({ onResult, onDocCreated }) {
       setError(err.message);
     } finally {
       setLoading(false);
+      setStatus('');
     }
   };
 
@@ -457,23 +552,26 @@ function QuickCompare({ onResult, onDocCreated }) {
   return (
     <div className="flex flex-col items-center justify-center h-full">
       <div
-        className={`w-full max-w-2xl border-3 border-dashed rounded-2xl p-12 text-center transition-all cursor-pointer
-          ${dragOver ? 'border-primary-400 bg-primary-50 scale-[1.02]' : 'border-gray-300 bg-white hover:border-primary-300 hover:bg-gray-50'}`}
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-        onDragLeave={() => setDragOver(false)}
+        className={`w-full max-w-2xl rounded-2xl p-12 text-center transition-all cursor-pointer
+          ${dragOver
+            ? 'border-4 border-primary-400 bg-primary-50 scale-[1.02] shadow-lg'
+            : 'border-4 border-dashed border-gray-300 bg-white hover:border-primary-300 hover:bg-gray-50'}`}
+        onDragOver={handleDragOver}
+        onDragEnter={handleDragOver}
+        onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         onClick={() => {
           if (!loading) document.getElementById('quick-file-input')?.click();
         }}
       >
         <input id="quick-file-input" type="file" className="hidden" multiple accept=".docx,.xlsx,.pptx,.pdf"
-          onChange={e => handleFiles(e.target.files)} />
+          onChange={e => { handleFiles(e.target.files); e.target.value = ''; }} />
 
         {loading ? (
           <div>
             <div className="inline-block w-12 h-12 border-4 border-primary-200 border-t-primary-600 rounded-full animate-spin mb-4"></div>
             <p className="text-lg font-medium text-gray-700">Vergleich läuft...</p>
-            <p className="text-sm text-gray-500 mt-1">Dateien werden analysiert und verifiziert</p>
+            <p className="text-sm text-gray-500 mt-1">{status || 'Dateien werden analysiert und verifiziert'}</p>
           </div>
         ) : (
           <div>
@@ -482,14 +580,16 @@ function QuickCompare({ onResult, onDocCreated }) {
                 d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
             </svg>
             <p className="text-xl font-semibold text-gray-700 mb-2">
-              2 Dateien hierher ziehen
+              Dateien hierher ziehen
             </p>
             <p className="text-sm text-gray-500 mb-4">
               oder klicken zum Auswählen
             </p>
-            <p className="text-xs text-gray-400">
-              DOCX, XLSX, PPTX oder PDF — die ältere Datei wird automatisch erkannt
-            </p>
+            <div className="text-xs text-gray-400 space-y-1">
+              <p>2 Dateien = sofortiger Vergleich (ältere wird automatisch erkannt)</p>
+              <p>1 Datei = wird automatisch mit der letzten Version verglichen</p>
+              <p>DOCX, XLSX, PPTX oder PDF</p>
+            </div>
           </div>
         )}
       </div>
@@ -503,7 +603,7 @@ function QuickCompare({ onResult, onDocCreated }) {
               {fileOld ? (
                 <div className="flex items-center justify-between">
                   <span className="font-medium text-gray-800 truncate">{fileOld.name}</span>
-                  <button onClick={(e) => { e.stopPropagation(); setFileOld(null); }}
+                  <button onClick={(e) => { e.stopPropagation(); setFileOld(null); setStatus(''); }}
                     className="text-gray-400 hover:text-red-500 ml-2 text-xs">X</button>
                 </div>
               ) : (
@@ -512,7 +612,7 @@ function QuickCompare({ onResult, onDocCreated }) {
             </div>
 
             <button onClick={(e) => { e.stopPropagation(); swap(); }}
-              className="text-gray-400 hover:text-primary-600 p-2" title="Reihenfolge tauschen">
+              className="text-gray-400 hover:text-primary-600 p-2 flex-shrink-0" title="Reihenfolge tauschen">
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
               </svg>
@@ -523,14 +623,20 @@ function QuickCompare({ onResult, onDocCreated }) {
               {fileNew ? (
                 <div className="flex items-center justify-between">
                   <span className="font-medium text-gray-800 truncate">{fileNew.name}</span>
-                  <button onClick={(e) => { e.stopPropagation(); setFileNew(null); }}
+                  <button onClick={(e) => { e.stopPropagation(); setFileNew(null); setStatus(''); }}
                     className="text-gray-400 hover:text-red-500 ml-2 text-xs">X</button>
                 </div>
               ) : (
-                <span className="text-gray-400">Datei auswählen...</span>
+                <span className="text-gray-400">Zweite Datei hinzufügen...</span>
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {status && !loading && (
+        <div className="mt-4 w-full max-w-2xl text-sm text-blue-700 bg-blue-50 border border-blue-200 p-3 rounded-lg">
+          {status}
         </div>
       )}
 
@@ -798,6 +904,7 @@ export default function App() {
             <QuickCompare
               onResult={(data) => { setQuickDiff(data); }}
               onDocCreated={loadDocuments}
+              documents={documents}
             />
           ) : (
             <div>
