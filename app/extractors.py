@@ -568,11 +568,73 @@ def extract_pdf(filepath):
     return pages, plain_text
 
 
+def extract_rtf(filepath):
+    """Extract text from RTF files."""
+    import re
+    with open(filepath, 'rb') as f:
+        raw = f.read()
+    # Try to decode as UTF-8, fallback to latin-1
+    try:
+        content = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        content = raw.decode('latin-1')
+
+    # Strip RTF control words and groups
+    text = re.sub(r'\\[a-z]+\d*\s?', '', content)
+    text = re.sub(r'[{}]', '', text)
+    text = re.sub(r'\\\'[0-9a-fA-F]{2}', '', text)  # hex chars
+    text = text.strip()
+
+    paragraphs = []
+    plain_parts = []
+    for i, line in enumerate(text.split('\n')):
+        line = line.strip()
+        if line:
+            paragraphs.append({
+                'index': i,
+                'text': line,
+                'html': escape(line),
+                'formatting': [{'text': line}],
+            })
+            plain_parts.append(line)
+
+    return paragraphs, '\n'.join(plain_parts)
+
+
+def extract_txt(filepath):
+    """Extract text from plain text files."""
+    # Try UTF-8, then latin-1
+    for enc in ['utf-8', 'utf-8-sig', 'latin-1']:
+        try:
+            with open(filepath, 'r', encoding=enc) as f:
+                content = f.read()
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        content = ''
+
+    paragraphs = []
+    plain_parts = []
+    for i, line in enumerate(content.split('\n')):
+        paragraphs.append({
+            'index': i,
+            'text': line,
+            'html': escape(line),
+            'formatting': [{'text': line}],
+        })
+        plain_parts.append(line)
+
+    return paragraphs, '\n'.join(plain_parts)
+
+
 EXTRACTORS = {
     'docx': extract_docx,
     'xlsx': extract_xlsx,
     'pptx': extract_pptx,
     'pdf': extract_pdf,
+    'rtf': extract_rtf,
+    'txt': extract_txt,
 }
 
 

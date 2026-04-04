@@ -20,22 +20,36 @@ def compute_hash(text: str) -> str:
 # Engine B: Plain-text line diff (used for ALL file types)
 # ---------------------------------------------------------------------------
 
-def plaintext_diff(text_a: str, text_b: str) -> List[Dict[str, Any]]:
+def plaintext_diff(text_a: str, text_b: str, options: dict = None) -> List[Dict[str, Any]]:
     """
     Line-by-line diff using SequenceMatcher with autojunk=False.
     Returns list of change dicts.
     """
+    options = options or {}
+
     lines_a = text_a.splitlines(keepends=True)
     lines_b = text_b.splitlines(keepends=True)
 
-    sm = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+    # Apply comparison options
+    def normalize(lines):
+        result = lines[:]
+        if options.get('ignore_case'):
+            result = [l.lower() for l in result]
+        if options.get('ignore_whitespace'):
+            result = [' '.join(l.split()) + '\n' if l.endswith('\n') else ' '.join(l.split()) for l in result]
+        return result
+
+    compare_a = normalize(lines_a)
+    compare_b = normalize(lines_b)
+
+    sm = difflib.SequenceMatcher(None, compare_a, compare_b, autojunk=False)
     changes = []
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == 'equal':
             continue
         change = {
-            'type': tag,  # 'replace', 'insert', 'delete'
+            'type': tag,
             'old_start': i1,
             'old_end': i2,
             'new_start': j1,
@@ -510,17 +524,26 @@ def verify_diff(text_a: str, text_b: str, all_changes: list) -> Dict[str, Any]:
 # Main diff function
 # ---------------------------------------------------------------------------
 
-def compute_diff(struct_a, text_a, struct_b, text_b, file_type):
+def compute_diff(struct_a, text_a, struct_b, text_b, file_type, options=None):
     """
     Dual-engine diff with verification.
     Returns the union of structural + plaintext changes, plus verification report.
     """
+    options = options or {}
+
+    # Filter headers/footers if option set
+    if options.get('ignore_headers_footers') and file_type == 'docx':
+        struct_a = [s for s in struct_a if s.get('context') not in ('Header', 'Footer')]
+        struct_b = [s for s in struct_b if s.get('context') not in ('Header', 'Footer')]
+        text_a = '\n'.join(s.get('text', '') for s in struct_a)
+        text_b = '\n'.join(s.get('text', '') for s in struct_b)
+
     # Engine A: structural diff
     structural_differ = STRUCTURAL_DIFFERS.get(file_type)
     structural_changes = structural_differ(struct_a, struct_b) if structural_differ else []
 
     # Engine B: plain-text diff
-    pt_changes = plaintext_diff(text_a, text_b)
+    pt_changes = plaintext_diff(text_a, text_b, options)
 
     # Union: include all changes from both engines
     # Structural changes are the primary display; plaintext changes catch anything missed
@@ -606,6 +629,12 @@ def compute_diff(struct_a, text_a, struct_b, text_b, file_type):
                     'right_html': html_lines_b.get(idx, ''),
                 })
 
+    # Count change types
+    insert_count = sum(1 for c in structural_changes if c.get('type') == 'insert')
+    delete_count = sum(1 for c in structural_changes if c.get('type') == 'delete')
+    replace_count = sum(1 for c in structural_changes if c.get('type') == 'replace')
+    formatting_count = sum(1 for c in structural_changes if c.get('type') == 'formatting')
+
     return {
         'structural_changes': structural_changes,
         'plaintext_changes': pt_changes,
@@ -614,7 +643,10 @@ def compute_diff(struct_a, text_a, struct_b, text_b, file_type):
         'summary': {
             'structural_count': len(structural_changes),
             'plaintext_count': len(pt_changes),
-            'formatting_count': sum(1 for c in structural_changes if c.get('type') == 'formatting'),
+            'insert_count': insert_count,
+            'delete_count': delete_count,
+            'replace_count': replace_count,
+            'formatting_count': formatting_count,
             'total_lines_a': len(lines_a),
             'total_lines_b': len(lines_b),
         },

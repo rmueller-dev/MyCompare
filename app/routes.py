@@ -14,7 +14,7 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 
 def get_file_type(filename):
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    if ext in ('docx', 'xlsx', 'pptx', 'pdf'):
+    if ext in ('docx', 'xlsx', 'pptx', 'pdf', 'rtf', 'txt'):
         return ext
     return None
 
@@ -41,7 +41,7 @@ def create_document():
 
     file_type = get_file_type(file.filename)
     if not file_type:
-        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF'}), 400
+        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF, RTF, TXT'}), 400
 
     # Check file size
     file.seek(0, 2)
@@ -170,8 +170,15 @@ def diff_versions(doc_id, version_a, version_b):
         struct_a, text_a = extract(ver_a.filepath, doc.file_type)
         struct_b, text_b = extract(ver_b.filepath, doc.file_type)
 
+        # Parse comparison options
+        options = {
+            'ignore_whitespace': request.args.get('ignore_whitespace') == '1',
+            'ignore_case': request.args.get('ignore_case') == '1',
+            'ignore_headers_footers': request.args.get('ignore_headers_footers') == '1',
+        }
+
         # Compute diff with verification
-        result = compute_diff(struct_a, text_a, struct_b, text_b, doc.file_type)
+        result = compute_diff(struct_a, text_a, struct_b, text_b, doc.file_type, options)
 
         result['version_a'] = ver_a.to_dict()
         result['version_b'] = ver_b.to_dict()
@@ -205,7 +212,7 @@ def quick_compare():
     type_new = get_file_type(file_new.filename)
 
     if not type_old or not type_new:
-        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF'}), 400
+        return jsonify({'error': 'Nicht unterstützter Dateityp. Erlaubt: DOCX, XLSX, PPTX, PDF, RTF, TXT'}), 400
     if type_old != type_new:
         return jsonify({'error': f'Dateitypen stimmen nicht überein: {type_old.upper()} vs. {type_new.upper()}'}), 400
 
@@ -255,7 +262,12 @@ def quick_compare():
         # Run diff immediately
         struct_a, text_a = extract(versions[0].filepath, file_type)
         struct_b, text_b = extract(versions[1].filepath, file_type)
-        result = compute_diff(struct_a, text_a, struct_b, text_b, file_type)
+        options = {
+            'ignore_whitespace': request.form.get('ignore_whitespace') == '1',
+            'ignore_case': request.form.get('ignore_case') == '1',
+            'ignore_headers_footers': request.form.get('ignore_headers_footers') == '1',
+        }
+        result = compute_diff(struct_a, text_a, struct_b, text_b, file_type, options)
 
         result['version_a'] = versions[0].to_dict()
         result['version_b'] = versions[1].to_dict()
@@ -268,6 +280,73 @@ def quick_compare():
         import traceback
         traceback.print_exc()
         return jsonify({'error': 'Vergleich fehlgeschlagen. Bitte prüfen Sie die Dateien.'}), 500
+    finally:
+        session.close()
+
+
+@api.route('/snippet-compare', methods=['POST'])
+def snippet_compare():
+    """Compare two text snippets directly (no file upload needed)."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'JSON body erforderlich'}), 400
+
+    text_a = data.get('text_a', '')
+    text_b = data.get('text_b', '')
+
+    if not text_a and not text_b:
+        return jsonify({'error': 'Mindestens ein Text erforderlich'}), 400
+
+    options = {
+        'ignore_whitespace': data.get('ignore_whitespace', False),
+        'ignore_case': data.get('ignore_case', False),
+    }
+
+    # Create simple structures for the diff engine
+    struct_a = [{'index': i, 'text': line, 'html': line, 'formatting': []}
+                for i, line in enumerate(text_a.split('\n'))]
+    struct_b = [{'index': i, 'text': line, 'html': line, 'formatting': []}
+                for i, line in enumerate(text_b.split('\n'))]
+
+    from .diff_engine import compute_diff
+    result = compute_diff(struct_a, text_a, struct_b, text_b, 'txt', options)
+
+    return jsonify(result)
+
+
+@api.route('/clean-metadata/<int:doc_id>/<int:ver_id>', methods=['GET'])
+def clean_metadata(doc_id, ver_id):
+    """Download a version with metadata stripped (author, comments, track changes)."""
+    import tempfile
+    import shutil
+
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        version = session.query(Version).filter_by(id=ver_id, document_id=doc_id).first()
+        if not doc or not version:
+            return jsonify({'error': 'Nicht gefunden'}), 404
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            cleaned_path = _clean_document_metadata(version.filepath, doc.file_type, tmpdir)
+            if not cleaned_path:
+                return jsonify({'error': 'Metadaten-Bereinigung nicht unterstützt für diesen Dateityp'}), 400
+
+            dl_name = f"{os.path.splitext(version.filename)[0]}_clean{os.path.splitext(version.filename)[1]}"
+            return send_from_directory(
+                os.path.dirname(cleaned_path),
+                os.path.basename(cleaned_path),
+                as_attachment=True,
+                download_name=dl_name,
+            )
+        finally:
+            import threading
+            def cleanup():
+                import time
+                time.sleep(10)
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            threading.Thread(target=cleanup, daemon=True).start()
     finally:
         session.close()
 
@@ -881,6 +960,107 @@ def _export_pptx_slides(filepath, slides, tmpdir, output_format):
         return out_path
     else:
         return _convert_to_pdf(filepath, tmpdir)
+
+
+def _clean_document_metadata(filepath, file_type, tmpdir):
+    """Remove metadata (author, comments, track changes) from a document."""
+    import shutil
+
+    if file_type == 'docx':
+        from docx import Document as DocxDocument
+        doc = DocxDocument(filepath)
+        # Remove core properties
+        cp = doc.core_properties
+        cp.author = ''
+        cp.last_modified_by = ''
+        cp.comments = ''
+        cp.keywords = ''
+        cp.subject = ''
+        cp.category = ''
+        # Remove comments from document body
+        from lxml import etree
+        nsmap = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+        body = doc.element.body
+        for comment_ref in body.findall('.//w:commentReference', nsmap):
+            parent = comment_ref.getparent()
+            if parent is not None:
+                parent.remove(comment_ref)
+        for comment_start in body.findall('.//w:commentRangeStart', nsmap):
+            parent = comment_start.getparent()
+            if parent is not None:
+                parent.remove(comment_start)
+        for comment_end in body.findall('.//w:commentRangeEnd', nsmap):
+            parent = comment_end.getparent()
+            if parent is not None:
+                parent.remove(comment_end)
+        # Accept all tracked changes (remove revision marks)
+        for ins in body.findall('.//w:ins', nsmap):
+            parent = ins.getparent()
+            idx = list(parent).index(ins)
+            for child in list(ins):
+                parent.insert(idx, child)
+                idx += 1
+            parent.remove(ins)
+        for dele in body.findall('.//w:del', nsmap):
+            parent = dele.getparent()
+            if parent is not None:
+                parent.remove(dele)
+
+        out_path = os.path.join(tmpdir, 'cleaned.docx')
+        doc.save(out_path)
+        return out_path
+
+    elif file_type == 'xlsx':
+        from openpyxl import load_workbook
+        wb = load_workbook(filepath)
+        wb.properties.creator = ''
+        wb.properties.lastModifiedBy = ''
+        wb.properties.description = ''
+        wb.properties.subject = ''
+        wb.properties.keywords = ''
+        # Remove comments from all cells
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.comment:
+                        cell.comment = None
+        out_path = os.path.join(tmpdir, 'cleaned.xlsx')
+        wb.save(out_path)
+        return out_path
+
+    elif file_type == 'pptx':
+        from pptx import Presentation
+        prs = Presentation(filepath)
+        prs.core_properties.author = ''
+        prs.core_properties.last_modified_by = ''
+        prs.core_properties.comments = ''
+        prs.core_properties.keywords = ''
+        prs.core_properties.subject = ''
+        # Remove notes from slides
+        for slide in prs.slides:
+            if slide.has_notes_slide:
+                notes_tf = slide.notes_slide.notes_text_frame
+                for para in notes_tf.paragraphs:
+                    for run in para.runs:
+                        run.text = ''
+        out_path = os.path.join(tmpdir, 'cleaned.pptx')
+        prs.save(out_path)
+        return out_path
+
+    elif file_type == 'pdf':
+        from PyPDF2 import PdfReader, PdfWriter
+        reader = PdfReader(filepath)
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+        # Remove metadata
+        writer.add_metadata({'/Producer': '', '/Creator': '', '/Author': ''})
+        out_path = os.path.join(tmpdir, 'cleaned.pdf')
+        with open(out_path, 'wb') as f:
+            writer.write(f)
+        return out_path
+
+    return None
 
 
 def _convert_to_pdf(filepath, tmpdir):
