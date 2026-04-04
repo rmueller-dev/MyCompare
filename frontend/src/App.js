@@ -1,5 +1,12 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import DOMPurify from 'dompurify';
+import ChangeSummary from './ChangeSummary';
+import ChangeFilters from './ChangeFilters';
+import ChangeNavigation from './ChangeNavigation';
+import CompareSettings from './CompareSettings';
+import ColorConfig from './ColorConfig';
+import ThreePaneDiff from './ThreePaneDiff';
+import SnippetCompare from './SnippetCompare';
 
 const API = '/api';
 
@@ -19,6 +26,8 @@ const FILE_TYPE_META = {
   xlsx: { label: 'Excel', color: 'bg-green-100 text-green-800', icon: 'X' },
   pptx: { label: 'PowerPoint', color: 'bg-orange-100 text-orange-800', icon: 'P' },
   pdf:  { label: 'PDF', color: 'bg-red-100 text-red-800', icon: 'PDF' },
+  rtf:  { label: 'RTF', color: 'bg-gray-100 text-gray-800', icon: 'R' },
+  txt:  { label: 'Text', color: 'bg-gray-100 text-gray-700', icon: 'T' },
 };
 
 // ─── SAFE HTML RENDER (sanitized with DOMPurify) ───
@@ -75,7 +84,7 @@ function ViewModeToggle({ mode, setMode }) {
 }
 
 // ─── DOWNLOAD BUTTONS ───
-function DownloadButtons({ docId, versionA, versionB, fileType }) {
+function DownloadButtons({ docId, versionA, versionB, fileType, latestVersionId }) {
   if (!docId || !versionA || !versionB) return null;
 
   const btnBase = "inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold transition-colors shadow-sm";
@@ -112,15 +121,25 @@ function DownloadButtons({ docId, versionA, versionB, fileType }) {
           Als PDF
         </a>
 
-        {/* Redline (Word only) */}
-        {fileType === 'docx' && (
-          <a href={`${API}/redline/${docId}/${versionA}/${versionB}`}
-            className={`${btnBase} bg-purple-600 hover:bg-purple-700 text-white`}
+        {/* Redline (all file types) */}
+        <a href={`${API}/redline/${docId}/${versionA}/${versionB}`}
+          className={`${btnBase} bg-purple-600 hover:bg-purple-700 text-white`}
+          download>
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+          </svg>
+          Änderungsmodus (Redline)
+        </a>
+
+        {/* Metadata cleaning */}
+        {latestVersionId && (
+          <a href={`${API}/clean-metadata/${docId}/${latestVersionId}`}
+            className={`${btnBase} bg-gray-500 hover:bg-gray-600 text-white`}
             download>
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
             </svg>
-            Word Änderungsmodus (Redline)
+            Metadaten entfernen
           </a>
         )}
       </div>
@@ -129,81 +148,209 @@ function DownloadButtons({ docId, versionA, versionB, fileType }) {
 }
 
 // ─── UNIFIED DIFF VIEW ───
-function DiffView({ diffResult }) {
+function DiffView({ diffResult, compareOptions, onCompareOptionsChange, onRerunDiff }) {
   const [viewMode, setViewMode] = useState('formatted');
+  const [paneMode, setPaneMode] = useState('three'); // 'three' or 'two'
+  const [activeFilter, setActiveFilter] = useState('all');
+  const [currentChangeIndex, setCurrentChangeIndex] = useState(-1);
+  const [colors, setColors] = useState({});
+  const [decisions, setDecisions] = useState({}); // idx -> 'accepted' | 'rejected'
+  const changeRefs = useRef({});
 
   if (!diffResult) return null;
   const { unified_lines, structural_changes, summary, verification } = diffResult;
 
-  const formattingChanges = structural_changes?.filter(c => c.type === 'formatting') || [];
-  const contentChanges = structural_changes?.filter(c => c.type !== 'formatting') || [];
+  const allChanges = structural_changes || [];
+  const formattingChanges = allChanges.filter(c => c.type === 'formatting');
+  const contentChanges = allChanges.filter(c => c.type !== 'formatting');
+
+  // Apply filter
+  const filteredContent = activeFilter === 'all' ? contentChanges
+    : activeFilter === 'formatting' ? []
+    : contentChanges.filter(c => c.type === activeFilter);
+  const filteredFormatting = (activeFilter === 'all' || activeFilter === 'formatting') ? formattingChanges : [];
+  const totalFiltered = filteredContent.length + filteredFormatting.length;
+
+  // Navigate to change
+  const navigateToChange = (idx) => {
+    setCurrentChangeIndex(idx);
+    const el = changeRefs.current[idx];
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
+  // Keyboard navigation
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      if (e.key === 'j' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        navigateToChange(Math.min(totalFiltered - 1, currentChangeIndex + 1));
+      } else if (e.key === 'k' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        navigateToChange(Math.max(0, currentChangeIndex - 1));
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  });
+
+  // Accept/Reject
+  const handleDecision = (idx, decision) => {
+    setDecisions(prev => ({ ...prev, [idx]: prev[idx] === decision ? null : decision }));
+  };
+  const acceptedCount = Object.values(decisions).filter(d => d === 'accepted').length;
+  const rejectedCount = Object.values(decisions).filter(d => d === 'rejected').length;
+
+  // Get latest version ID for metadata cleaning
+  const versions = diffResult.document?.versions || [];
+  const latestVersionId = versions.length > 0 ? versions[versions.length - 1].id : null;
 
   return (
     <div>
       <VerificationBadge verification={verification} />
 
-      {/* Download buttons — prominent */}
+      {/* Download buttons */}
       <DownloadButtons
         docId={diffResult.document?.id}
         versionA={diffResult.version_a?.version_number}
         versionB={diffResult.version_b?.version_number}
         fileType={diffResult.document?.file_type}
+        latestVersionId={latestVersionId}
       />
 
-      <div className="mb-4 flex flex-wrap items-center gap-4 text-sm text-gray-600">
-        <span>Inhaltsänderungen: <b>{contentChanges.length}</b></span>
-        <span>Formatierungsänderungen: <b>{summary?.formatting_count || 0}</b></span>
-        <span>Plaintext-Änderungen: <b>{summary?.plaintext_count}</b></span>
-        <span>Zeilen alt: <b>{summary?.total_lines_a}</b></span>
-        <span>Zeilen neu: <b>{summary?.total_lines_b}</b></span>
-        <div className="ml-auto">
-          <ViewModeToggle mode={viewMode} setMode={setViewMode} />
-        </div>
+      {/* Change Summary */}
+      <ChangeSummary summary={summary} colors={colors} />
+
+      {/* Settings row */}
+      <div className="flex flex-wrap gap-4 items-start">
+        <CompareSettings options={compareOptions || {}} onChange={(opts) => { if (onCompareOptionsChange) onCompareOptionsChange(opts); }} />
+        <ColorConfig colors={colors} onChange={setColors} />
       </div>
 
+      {/* Filters + Navigation + View toggles */}
+      <ChangeFilters activeFilter={activeFilter} onFilterChange={setActiveFilter} />
+
+      <div className="flex items-center gap-4 mb-4 flex-wrap">
+        <ChangeNavigation currentIndex={currentChangeIndex} totalChanges={totalFiltered} onNavigate={navigateToChange} />
+        <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
+          {[['three', '3-Fenster'], ['two', '2-Fenster']].map(([val, label]) => (
+            <button key={val} onClick={() => setPaneMode(val)}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                paneMode === val ? 'bg-white shadow text-gray-800' : 'text-gray-500 hover:text-gray-700'
+              }`}>{label}</button>
+          ))}
+        </div>
+        <ViewModeToggle mode={viewMode} setMode={setViewMode} />
+        {/* Accept/Reject summary */}
+        {(acceptedCount > 0 || rejectedCount > 0) && (
+          <div className="text-xs text-gray-500 ml-auto">
+            <span className="text-green-600 font-medium">{acceptedCount} akzeptiert</span>
+            {' · '}
+            <span className="text-red-600 font-medium">{rejectedCount} abgelehnt</span>
+            {' · '}
+            <span>{totalFiltered - acceptedCount - rejectedCount} offen</span>
+          </div>
+        )}
+      </div>
+
+      {/* Accept/Reject all buttons */}
+      {totalFiltered > 0 && (
+        <div className="flex gap-2 mb-4">
+          <button onClick={() => {
+            const d = {};
+            for (let i = 0; i < totalFiltered; i++) d[i] = 'accepted';
+            setDecisions(d);
+          }} className="text-xs px-3 py-1 rounded bg-green-50 text-green-700 hover:bg-green-100 border border-green-200">
+            Alle akzeptieren
+          </button>
+          <button onClick={() => {
+            const d = {};
+            for (let i = 0; i < totalFiltered; i++) d[i] = 'rejected';
+            setDecisions(d);
+          }} className="text-xs px-3 py-1 rounded bg-red-50 text-red-700 hover:bg-red-100 border border-red-200">
+            Alle ablehnen
+          </button>
+          <button onClick={() => setDecisions({})}
+            className="text-xs px-3 py-1 rounded bg-gray-50 text-gray-600 hover:bg-gray-100 border border-gray-200">
+            Zurücksetzen
+          </button>
+        </div>
+      )}
+
       {/* Formatting-only changes */}
-      {formattingChanges.length > 0 && (
+      {filteredFormatting.length > 0 && (
         <div className="mb-4">
           <h3 className="font-semibold text-gray-700 mb-2 flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-purple-500"></span>
-            Formatierungsänderungen
+            Formatierungsänderungen ({filteredFormatting.length})
           </h3>
           <div className="space-y-2">
-            {formattingChanges.map((ch, i) => (
+            {filteredFormatting.map((ch, i) => (
               <FormattingChange key={i} change={ch} viewMode={viewMode} />
             ))}
           </div>
         </div>
       )}
 
-      {/* Structural content changes */}
-      {contentChanges.length > 0 && (
+      {/* Structural content changes with accept/reject */}
+      {filteredContent.length > 0 && (
         <div className="mb-4">
-          <h3 className="font-semibold text-gray-700 mb-2">Strukturelle Änderungen</h3>
+          <h3 className="font-semibold text-gray-700 mb-2">Strukturelle Änderungen ({filteredContent.length})</h3>
           <div className="space-y-2">
-            {contentChanges.map((ch, i) => (
-              <StructuralChange key={i} change={ch} viewMode={viewMode} />
+            {filteredContent.map((ch, i) => (
+              <div key={i}
+                ref={(el) => { changeRefs.current[i] = el; }}
+                className={`${currentChangeIndex === i ? 'ring-2 ring-blue-400' : ''} ${
+                  decisions[i] === 'accepted' ? 'opacity-60 bg-green-50' : decisions[i] === 'rejected' ? 'opacity-40 bg-red-50 line-through' : ''
+                } rounded-lg transition-all`}
+              >
+                <div className="flex items-center gap-1 mb-1 px-3 pt-2">
+                  <span className="text-xs font-bold text-gray-400">#{i + 1}</span>
+                  <button onClick={() => handleDecision(i, 'accepted')} title="Akzeptieren"
+                    className={`ml-auto w-6 h-6 rounded flex items-center justify-center text-xs ${
+                      decisions[i] === 'accepted' ? 'bg-green-500 text-white' : 'bg-gray-100 text-gray-500 hover:bg-green-100'
+                    }`}>✓</button>
+                  <button onClick={() => handleDecision(i, 'rejected')} title="Ablehnen"
+                    className={`w-6 h-6 rounded flex items-center justify-center text-xs ${
+                      decisions[i] === 'rejected' ? 'bg-red-500 text-white' : 'bg-gray-100 text-gray-500 hover:bg-red-100'
+                    }`}>✗</button>
+                </div>
+                <StructuralChange change={ch} viewMode={viewMode} />
+              </div>
             ))}
           </div>
         </div>
       )}
 
-      {/* Side-by-side diff */}
+      {/* Line-level diff: Three-pane or Two-pane */}
       <h3 className="font-semibold text-gray-700 mb-2">Zeilenvergleich</h3>
-      <div className="border rounded-lg overflow-hidden text-sm font-mono">
-        <div className="grid grid-cols-2 bg-gray-100 border-b text-xs font-semibold text-gray-600 uppercase">
-          <div className="px-3 py-1.5">Version A (alt)</div>
-          <div className="px-3 py-1.5">Version B (neu)</div>
+      {paneMode === 'three' ? (
+        <ThreePaneDiff
+          unifiedLines={unified_lines}
+          filter={activeFilter}
+          colors={colors}
+          changeRefs={changeRefs}
+          currentChangeIndex={currentChangeIndex}
+        />
+      ) : (
+        <div className="border rounded-lg overflow-hidden text-sm font-mono">
+          <div className="grid grid-cols-2 bg-gray-100 border-b text-xs font-semibold text-gray-600 uppercase">
+            <div className="px-3 py-1.5">Version A (alt)</div>
+            <div className="px-3 py-1.5">Version B (neu)</div>
+          </div>
+          <div className="max-h-[60vh] overflow-auto">
+            {unified_lines && unified_lines.filter(line => {
+              if (!activeFilter || activeFilter === 'all') return true;
+              return line.type === activeFilter || line.type === 'equal';
+            }).map((line, i) => (
+              <DiffLine key={i} line={line} viewMode={viewMode} />
+            ))}
+            {(!unified_lines || unified_lines.length === 0) && (
+              <div className="p-4 text-center text-gray-400">Keine Zeilen zum Anzeigen</div>
+            )}
+          </div>
         </div>
-        <div className="max-h-[60vh] overflow-auto">
-          {unified_lines && unified_lines.map((line, i) => (
-            <DiffLine key={i} line={line} viewMode={viewMode} />
-          ))}
-          {(!unified_lines || unified_lines.length === 0) && (
-            <div className="p-4 text-center text-gray-400">Keine Zeilen zum Anzeigen</div>
-          )}
-        </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -415,7 +562,7 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
   const [error, setError] = useState('');
   const [dragOver, setDragOver] = useState(false);
 
-  const ALLOWED = ['.docx', '.xlsx', '.pptx', '.pdf'];
+  const ALLOWED = ['.docx', '.xlsx', '.pptx', '.pdf', '.rtf', '.txt'];
   const isAllowed = (name) => ALLOWED.some(ext => name.toLowerCase().endsWith(ext));
   const getExt = (name) => name.split('.').pop().toLowerCase();
 
@@ -600,7 +747,7 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
           if (!loading) document.getElementById('quick-file-input')?.click();
         }}
       >
-        <input id="quick-file-input" type="file" className="hidden" multiple accept=".docx,.xlsx,.pptx,.pdf"
+        <input id="quick-file-input" type="file" className="hidden" multiple accept=".docx,.xlsx,.pptx,.pdf,.rtf,.txt"
           onChange={e => { handleFiles(e.target.files); e.target.value = ''; }} />
 
         {loading ? (
@@ -624,7 +771,7 @@ function QuickCompare({ onResult, onDocCreated, documents }) {
             <div className="text-xs text-gray-400 space-y-1">
               <p>2 Dateien = sofortiger Vergleich (ältere wird automatisch erkannt)</p>
               <p>1 Datei = wird automatisch mit der letzten Version verglichen</p>
-              <p>DOCX, XLSX, PPTX oder PDF</p>
+              <p>DOCX, XLSX, PPTX, PDF, RTF oder TXT</p>
             </div>
           </div>
         )}
@@ -761,12 +908,12 @@ function UploadModal({ onClose, onUpload, documents }) {
 
           <div className="mb-4">
             <label className="block border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:border-primary-400 transition-colors">
-              <input type="file" className="hidden" accept=".docx,.xlsx,.pptx,.pdf"
+              <input type="file" className="hidden" accept=".docx,.xlsx,.pptx,.pdf,.rtf,.txt"
                 onChange={e => setFile(e.target.files[0])} />
               {file ? (
                 <span className="text-sm font-medium text-primary-700">{file.name}</span>
               ) : (
-                <span className="text-sm text-gray-500">DOCX, XLSX, PPTX oder PDF hierher ziehen oder klicken</span>
+                <span className="text-sm text-gray-500">DOCX, XLSX, PPTX, PDF, RTF oder TXT hierher ziehen oder klicken</span>
               )}
             </label>
           </div>
@@ -799,6 +946,9 @@ export default function App() {
   const [versionB, setVersionB] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [quickDiff, setQuickDiff] = useState(null);
+  const [appMode, setAppMode] = useState('file'); // 'file' | 'snippet'
+  const [snippetDiff, setSnippetDiff] = useState(null);
+  const [compareOptions, setCompareOptions] = useState({});
 
   const loadDocuments = useCallback(async () => {
     try {
@@ -878,10 +1028,22 @@ export default function App() {
             </span>
           )}
         </div>
-        <button onClick={() => setShowUpload(true)}
-          className="bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-primary-700 transition-colors shadow-sm">
-          + Hochladen
-        </button>
+        <div className="flex items-center gap-3">
+          <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
+            <button onClick={() => { setAppMode('file'); setSnippetDiff(null); }}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${appMode === 'file' ? 'bg-white shadow text-gray-800' : 'text-gray-500'}`}>
+              Datei-Vergleich
+            </button>
+            <button onClick={() => setAppMode('snippet')}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${appMode === 'snippet' ? 'bg-white shadow text-gray-800' : 'text-gray-500'}`}>
+              Text-Vergleich
+            </button>
+          </div>
+          <button onClick={() => setShowUpload(true)}
+            className="bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-primary-700 transition-colors shadow-sm">
+            + Hochladen
+          </button>
+        </div>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
@@ -896,7 +1058,7 @@ export default function App() {
                 Keine Dokumente.<br />Laden Sie eine Datei hoch.
               </div>
             )}
-            {['docx', 'xlsx', 'pptx', 'pdf'].map(type => {
+            {['docx', 'xlsx', 'pptx', 'pdf', 'rtf', 'txt'].map(type => {
               const docs = grouped[type];
               if (!docs || docs.length === 0) return null;
               const meta = FILE_TYPE_META[type];
@@ -925,7 +1087,24 @@ export default function App() {
 
         {/* MAIN AREA */}
         <main className="flex-1 overflow-y-auto p-6">
-          {quickDiff && !selectedDoc ? (
+          {appMode === 'snippet' ? (
+            <div>
+              {snippetDiff ? (
+                <div>
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-2xl font-bold text-gray-800">Text-Vergleich</h2>
+                    <button onClick={() => setSnippetDiff(null)}
+                      className="text-sm text-gray-500 hover:text-gray-700 hover:bg-gray-100 px-3 py-1.5 rounded">
+                      Neuer Vergleich
+                    </button>
+                  </div>
+                  <DiffView diffResult={snippetDiff} compareOptions={compareOptions} onCompareOptionsChange={setCompareOptions} />
+                </div>
+              ) : (
+                <SnippetCompare onResult={(data) => setSnippetDiff(data)} />
+              )}
+            </div>
+          ) : quickDiff && !selectedDoc ? (
             <div>
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-2xl font-bold text-gray-800">Schnellvergleich</h2>
@@ -934,7 +1113,7 @@ export default function App() {
                   Neuer Vergleich
                 </button>
               </div>
-              <DiffView diffResult={quickDiff} />
+              <DiffView diffResult={quickDiff} compareOptions={compareOptions} onCompareOptionsChange={setCompareOptions} />
             </div>
           ) : !selectedDoc ? (
             <QuickCompare
@@ -1083,7 +1262,7 @@ export default function App() {
                   <p className="text-sm text-gray-500 mt-3">Vergleich wird durchgeführt...</p>
                 </div>
               )}
-              {diffResult && <DiffView diffResult={diffResult} />}
+              {diffResult && <DiffView diffResult={diffResult} compareOptions={compareOptions} onCompareOptionsChange={setCompareOptions} />}
             </div>
           )}
         </main>
