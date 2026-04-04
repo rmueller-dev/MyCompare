@@ -23,8 +23,15 @@ source venv/bin/activate
 echo "[2/4] Installiere Python-Abhängigkeiten..."
 pip install -q -r requirements.txt
 
-# 3. Build React frontend (only if build dir missing)
+# 3. Build React frontend (rebuild if source is newer than build)
+NEEDS_BUILD=0
 if [ ! -d "frontend/build" ]; then
+    NEEDS_BUILD=1
+elif [ -n "$(find frontend/src -newer frontend/build/index.html -name '*.js' 2>/dev/null)" ]; then
+    NEEDS_BUILD=1
+fi
+
+if [ "$NEEDS_BUILD" = "1" ]; then
     echo "[3/4] Baue React-Frontend..."
     cd frontend
     if [ ! -d "node_modules" ]; then
@@ -33,7 +40,7 @@ if [ ! -d "frontend/build" ]; then
     npm run build 2>&1 | tail -1
     cd "$SCRIPT_DIR"
 else
-    echo "[3/4] Frontend bereits gebaut."
+    echo "[3/4] Frontend bereits gebaut (aktuell)."
 fi
 
 # 4. Find free port (AirPlay on macOS uses 5000)

@@ -9,7 +9,7 @@ from .routes import api
 def create_app():
     app = Flask(__name__, static_folder=None)
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB
-    CORS(app, origins=['http://localhost:5000', 'http://127.0.0.1:5000'])
+    CORS(app, origins=['http://localhost:5000', 'http://127.0.0.1:5000', 'http://localhost:5050', 'http://127.0.0.1:5050'])
 
     # Register API blueprint
     app.register_blueprint(api)
