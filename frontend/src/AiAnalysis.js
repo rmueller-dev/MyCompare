@@ -5,6 +5,7 @@ const API = '/api';
 export default function AiAnalysis({ docId, versionA, versionB, onClose }) {
   const [step, setStep] = useState('form'); // 'form' | 'loading' | 'result' | 'error'
   const [clientParty, setClientParty] = useState('');
+  const [clientVersion, setClientVersion] = useState('a'); // 'a' = Version A is client's, 'b' = Version B
   const [documentContext, setDocumentContext] = useState('');
   const [model, setModel] = useState('');
   const [models, setModels] = useState([]);
@@ -35,6 +36,7 @@ export default function AiAnalysis({ docId, versionA, versionB, onClose }) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             client_party: clientParty.trim(),
+            client_version: clientVersion,
             document_context: documentContext.trim(),
             model: model || undefined,
           }),
@@ -102,6 +104,41 @@ export default function AiAnalysis({ docId, versionA, versionB, onClose }) {
                   className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-violet-500 focus:border-violet-500"
                   autoFocus
                 />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-1">
+                  Welche Version ist Ihre? *
+                </label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setClientVersion('a')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${
+                      clientVersion === 'a'
+                        ? 'bg-violet-100 border-violet-500 text-violet-800'
+                        : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    Version A (V{versionA})
+                    <span className="block text-xs mt-0.5 opacity-70">Vorversion — Standard</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setClientVersion('b')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${
+                      clientVersion === 'b'
+                        ? 'bg-violet-100 border-violet-500 text-violet-800'
+                        : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    Version B (V{versionB})
+                    <span className="block text-xs mt-0.5 opacity-70">Aktuelle Version</span>
+                  </button>
+                </div>
+                <p className="text-xs text-gray-400 mt-1">
+                  Die Gegenseite hat die andere Version erstellt. Änderungen werden aus Ihrer Sicht bewertet.
+                </p>
               </div>
 
               <div>

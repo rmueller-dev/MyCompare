@@ -23,8 +23,16 @@ def _check_ollama():
         return False, []
 
 
-def _build_prompt(changes: List[Dict], client_party: str, document_context: str = "") -> str:
-    """Build the analysis prompt for the LLM."""
+def _build_prompt(changes: List[Dict], client_party: str,
+                  document_context: str = "", client_version: str = "a") -> str:
+    """Build the analysis prompt for the LLM.
+
+    Args:
+        client_version: 'a' means client authored Version A (old), counterparty
+                        made changes in Version B (new).
+                        'b' means client authored Version B (new), the old
+                        version is the counterparty's.
+    """
     changes_text = []
     for i, ch in enumerate(changes, 1):
         ch_type = ch.get("type", "unbekannt")
@@ -49,13 +57,29 @@ def _build_prompt(changes: List[Dict], client_party: str, document_context: str 
 
     changes_block = "\n".join(changes_text)
 
+    if client_version == "a":
+        perspective = (
+            f"Version A (alt) ist das Dokument deines Mandanten ({client_party}). "
+            f"Version B (neu) enthält die Änderungen der Gegenseite. "
+            f"Analysiere was die Gegenseite geändert hat und bewerte die Auswirkungen "
+            f"auf deinen Mandanten."
+        )
+    else:
+        perspective = (
+            f"Version B (neu) ist das Dokument deines Mandanten ({client_party}). "
+            f"Version A (alt) ist das Dokument der Gegenseite. "
+            f"Die Änderungen zeigen die Unterschiede zwischen dem Entwurf der Gegenseite "
+            f"und dem Entwurf deines Mandanten. Bewerte was dein Mandant geändert hat "
+            f"und welche Positionen der Gegenseite dadurch adressiert werden."
+        )
+
     prompt = f"""Du bist ein erfahrener deutscher Wirtschaftsanwalt. Du vertrittst: **{client_party}**
 
-Analysiere die folgenden Änderungen in einem Vertragsdokument. Die Änderungen wurden von der Gegenseite vorgenommen.
+{perspective}
 
 {f"Dokumentkontext: {document_context}" if document_context else ""}
 
-ÄNDERUNGEN:
+ÄNDERUNGEN (Version A → Version B):
 {changes_block}
 
 Erstelle eine strukturierte Issue List im folgenden Format. Bewerte jede Änderung aus Sicht deines Mandanten ({client_party}):
@@ -82,6 +106,7 @@ def analyze_changes(
     client_party: str,
     document_context: str = "",
     model: str = None,
+    client_version: str = "a",
 ) -> Dict[str, Any]:
     """
     Send changes to Ollama for AI analysis.
@@ -119,7 +144,8 @@ def analyze_changes(
                 "analysis": None,
             }
 
-    prompt = _build_prompt(changes, client_party, document_context)
+    prompt = _build_prompt(changes, client_party, document_context,
+                           client_version=client_version)
 
     try:
         response = requests.post(

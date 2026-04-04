@@ -3335,6 +3335,7 @@ def ai_analyze(doc_id, version_a, version_b):
 
     model = data.get('model')
     document_context = data.get('document_context', '')
+    client_version = data.get('client_version', 'a')
 
     session = SessionLocal()
     try:
@@ -3407,6 +3408,7 @@ def ai_analyze(doc_id, version_a, version_b):
             client_party=client_party,
             document_context=document_context or doc.name,
             model=model,
+            client_version=client_version,
         )
 
         if truncated:
