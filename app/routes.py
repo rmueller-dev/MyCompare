@@ -7,7 +7,7 @@ from .models import SessionLocal, Document, Version, RenderingSet, Folder, STORA
 from .extractors import extract
 from .diff_engine import compute_diff
 from .image_diff import extract_images, compare_images
-from .ai_analysis import analyze_changes, _check_ollama
+from .ai_analysis import analyze_changes, _check_ollama, get_providers_status, set_api_key, get_api_key
 
 api = Blueprint('api', __name__, url_prefix='/api')
 
@@ -3673,11 +3673,34 @@ def multi_compare():
 
 @api.route('/ai/status', methods=['GET'])
 def ai_status():
-    """Check if Ollama is running and which models are available."""
-    available, models = _check_ollama()
+    """Check AI providers status (Ollama + Claude)."""
+    providers = get_providers_status()
+    # Backwards-compatible: top-level 'available' and 'models' for Ollama
     return jsonify({
-        'available': available,
-        'models': models,
+        'available': providers['ollama']['available'],
+        'models': providers['ollama']['models'],
+        'providers': providers,
+    })
+
+
+@api.route('/ai/api-key', methods=['POST'])
+def ai_set_api_key():
+    """Set the Anthropic API key."""
+    data = request.get_json() or {}
+    key = data.get('api_key', '').strip()
+    if not key:
+        return jsonify({'error': 'Kein API-Key angegeben'}), 400
+    set_api_key(key)
+    return jsonify({'status': 'ok', 'message': 'API-Key gespeichert'})
+
+
+@api.route('/ai/api-key', methods=['GET'])
+def ai_get_api_key():
+    """Check if an API key is configured (don't return the actual key)."""
+    key = get_api_key()
+    return jsonify({
+        'has_key': bool(key),
+        'key_preview': f"{key[:10]}...{key[-4:]}" if key and len(key) > 14 else '',
     })
 
 
@@ -3687,10 +3710,11 @@ def ai_analyze(doc_id, version_a, version_b):
     """
     Generate an AI-powered issue list from the changes between two versions.
     Requires JSON body: { "client_party": "Käufer" }
-    Optional: { "model": "llama3.1", "document_context": "Kaufvertrag" }
+    Optional: { "model": "...", "document_context": "...", "provider": "ollama"|"claude" }
     """
     data = request.get_json() or {}
     client_party = data.get('client_party', '').strip()
+    provider = data.get('provider', 'ollama')
     if not client_party:
         return jsonify({
             'error': 'Bitte geben Sie an, wen Sie vertreten (client_party).'
@@ -3799,6 +3823,7 @@ def ai_analyze(doc_id, version_a, version_b):
             document_context=document_context or doc.name,
             model=model,
             client_version=client_version,
+            provider=provider,
         )
 
         if truncated:

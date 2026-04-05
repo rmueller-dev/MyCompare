@@ -1,15 +1,35 @@
 """
-AI-powered document change analysis using local Ollama LLM.
+AI-powered document change analysis using local Ollama LLM or Claude API.
 Generates a professional Issue List from redline changes, structured
 in sections with traffic-light severity ratings, like M&A transaction issue lists.
 """
 import json
+import os
 import re
 import requests
 from typing import List, Dict, Any
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "qwen2.5:14b"
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODELS = {
+    "claude-sonnet-4-20250514": "Claude Sonnet 4",
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+    "claude-opus-4-20250514": "Claude Opus 4",
+}
+
+# API key can be set via environment variable or passed per request
+_api_key_store = {"key": os.environ.get("ANTHROPIC_API_KEY", "")}
+
+
+def set_api_key(key: str):
+    """Store the Anthropic API key in memory."""
+    _api_key_store["key"] = key.strip()
+
+
+def get_api_key() -> str:
+    return _api_key_store["key"] or os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 def _check_ollama():
@@ -22,6 +42,37 @@ def _check_ollama():
         return False, []
     except Exception:
         return False, []
+
+
+def _check_claude():
+    """Check if Claude API key is configured and valid."""
+    key = get_api_key()
+    if not key:
+        return False, "Kein API-Key konfiguriert"
+    if not key.startswith("sk-ant-"):
+        return False, "Ungültiges API-Key Format"
+    return True, "OK"
+
+
+def get_providers_status():
+    """Return status of all available AI providers."""
+    ollama_ok, ollama_models = _check_ollama()
+    claude_ok, claude_msg = _check_claude()
+    return {
+        "ollama": {
+            "available": ollama_ok,
+            "models": ollama_models,
+            "default_model": DEFAULT_MODEL,
+        },
+        "claude": {
+            "available": claude_ok,
+            "message": claude_msg if not claude_ok else "Verbunden",
+            "models": list(CLAUDE_MODELS.keys()),
+            "model_names": CLAUDE_MODELS,
+            "default_model": CLAUDE_DEFAULT_MODEL,
+            "has_key": bool(get_api_key()),
+        },
+    }
 
 
 def _build_prompt(changes: List[Dict], client_party: str,
@@ -52,15 +103,11 @@ def _build_prompt(changes: List[Dict], client_party: str,
             f"Version A (alt) ist das Dokument deines Mandanten ({client_party}). "
             f"Version B (neu) enthält die Änderungen der Gegenseite."
         )
-        col_a_label = f"Entwurf {client_party}"
-        col_b_label = "Mark-up Gegenseite"
     else:
         perspective = (
             f"Version B (neu) ist das Dokument deines Mandanten ({client_party}). "
             f"Version A (alt) ist das Dokument der Gegenseite."
         )
-        col_a_label = "Entwurf Gegenseite"
-        col_b_label = f"Mark-up {client_party}"
 
     doc_ctx = f"\nDokumenttyp: {document_context}" if document_context else ""
 
@@ -123,7 +170,6 @@ Regeln:
 
 def _parse_json_response(text: str) -> Dict:
     """Try to extract JSON from LLM response, handling common issues."""
-    # Try direct parse
     text = text.strip()
     try:
         return json.loads(text)
@@ -150,14 +196,130 @@ def _parse_json_response(text: str) -> Dict:
     return None
 
 
-def analyze_changes(
+def _build_result(raw_text: str, use_model: str, changes: List[Dict],
+                  client_party: str, provider: str) -> Dict[str, Any]:
+    """Parse LLM response and build result dict."""
+    parsed = _parse_json_response(raw_text)
+
+    if parsed and "sections" in parsed:
+        return {
+            "status": "ok",
+            "structured": True,
+            "issue_list": parsed,
+            "raw": raw_text,
+            "model": use_model,
+            "provider": provider,
+            "change_count": len(changes),
+            "client_party": client_party,
+        }
+    else:
+        return {
+            "status": "ok",
+            "structured": False,
+            "analysis": raw_text,
+            "model": use_model,
+            "provider": provider,
+            "change_count": len(changes),
+            "client_party": client_party,
+        }
+
+
+def analyze_changes_claude(
     changes: List[Dict],
     client_party: str,
     document_context: str = "",
     model: str = None,
     client_version: str = "a",
 ) -> Dict[str, Any]:
-    """Send changes to Ollama for AI analysis, returns structured issue list."""
+    """Send changes to Claude API for analysis."""
+    api_key = get_api_key()
+    if not api_key:
+        return {
+            "status": "error",
+            "error": "Kein Anthropic API-Key konfiguriert. Bitte geben Sie "
+                     "Ihren API-Key in den Einstellungen ein.",
+        }
+
+    use_model = model or CLAUDE_DEFAULT_MODEL
+
+    prompt = _build_prompt(changes, client_party, document_context,
+                           client_version=client_version)
+
+    try:
+        response = requests.post(
+            CLAUDE_API_URL,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": use_model,
+                "max_tokens": 8192,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+            },
+            timeout=120,
+        )
+
+        if response.status_code == 401:
+            return {
+                "status": "error",
+                "error": "Ungültiger API-Key. Bitte prüfen Sie Ihren Anthropic API-Key.",
+            }
+        if response.status_code == 429:
+            return {
+                "status": "error",
+                "error": "Rate Limit erreicht. Bitte warten Sie einen Moment.",
+            }
+        if response.status_code != 200:
+            error_detail = ""
+            try:
+                error_detail = response.json().get("error", {}).get("message", "")
+            except Exception:
+                pass
+            return {
+                "status": "error",
+                "error": f"Claude API-Fehler: HTTP {response.status_code}"
+                         + (f" — {error_detail}" if error_detail else ""),
+            }
+
+        data = response.json()
+        raw_text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                raw_text += block.get("text", "")
+
+        return _build_result(raw_text, use_model, changes, client_party, "claude")
+
+    except requests.exceptions.Timeout:
+        return {
+            "status": "error",
+            "error": "Zeitüberschreitung bei der Claude API.",
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": f"Fehler bei der Claude-Analyse: {str(e)}",
+        }
+
+
+def analyze_changes(
+    changes: List[Dict],
+    client_party: str,
+    document_context: str = "",
+    model: str = None,
+    client_version: str = "a",
+    provider: str = "ollama",
+) -> Dict[str, Any]:
+    """Send changes to AI for analysis. Provider: 'ollama' or 'claude'."""
+    if provider == "claude":
+        return analyze_changes_claude(
+            changes, client_party, document_context, model, client_version)
+
+    # --- Ollama provider ---
     available, models = _check_ollama()
     if not available:
         return {
@@ -181,7 +343,6 @@ def analyze_changes(
     prompt = _build_prompt(changes, client_party, document_context,
                            client_version=client_version)
 
-    # Scale num_predict based on number of changes
     num_predict = 4096 if len(changes) <= 20 else 6144
 
     try:
@@ -209,29 +370,7 @@ def analyze_changes(
         data = response.json()
         raw_text = data.get("response", "")
 
-        # Try to parse structured JSON
-        parsed = _parse_json_response(raw_text)
-
-        if parsed and "sections" in parsed:
-            return {
-                "status": "ok",
-                "structured": True,
-                "issue_list": parsed,
-                "raw": raw_text,
-                "model": use_model,
-                "change_count": len(changes),
-                "client_party": client_party,
-            }
-        else:
-            # Fallback: return raw text
-            return {
-                "status": "ok",
-                "structured": False,
-                "analysis": raw_text,
-                "model": use_model,
-                "change_count": len(changes),
-                "client_party": client_party,
-            }
+        return _build_result(raw_text, use_model, changes, client_party, "ollama")
 
     except requests.exceptions.Timeout:
         return {
