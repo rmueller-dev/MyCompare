@@ -859,8 +859,8 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
         all_changes.append({
             'num': change_counter[0],
             'type': change_type,
-            'old': (old_text or '')[:120],
-            'new': (new_text or '')[:120],
+            'old': old_text or '',
+            'new': new_text or '',
             'para': para_num,
         })
         return change_counter[0]
@@ -1361,13 +1361,13 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                         _sanitize_element_from_a(tr_el)
                         _wrap_all_runs_in_element_as_del(tr_el)
                         _mark_row_paragraph_marks_deleted(tr_el)
-                        record_change('Tabellenänderung', rtexts_a[idx][:120], '', 0)
+                        record_change('Tabellenänderung', rtexts_a[idx][:500], '', 0)
                         tbl_el.append(tr_el)
 
                     for idx in range(rj1, rj2):
                         tr_el = etree.fromstring(etree.tostring(tbl_b.rows[idx]._tr))
                         _wrap_all_runs_in_element_as_ins(tr_el)
-                        record_change('Tabellenänderung', '', rtexts_b[idx][:120], 0)
+                        record_change('Tabellenänderung', '', rtexts_b[idx][:500], 0)
                         tbl_el.append(tr_el)
 
                 elif rtag == 'delete':
@@ -1376,14 +1376,14 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                         _sanitize_element_from_a(tr_el)
                         _wrap_all_runs_in_element_as_del(tr_el)
                         _mark_row_paragraph_marks_deleted(tr_el)
-                        record_change('Tabellenänderung', rtexts_a[idx][:120], '', 0)
+                        record_change('Tabellenänderung', rtexts_a[idx][:500], '', 0)
                         tbl_el.append(tr_el)
 
                 elif rtag == 'insert':
                     for idx in range(rj1, rj2):
                         tr_el = etree.fromstring(etree.tostring(tbl_b.rows[idx]._tr))
                         _wrap_all_runs_in_element_as_ins(tr_el)
-                        record_change('Tabellenänderung', '', rtexts_b[idx][:120], 0)
+                        record_change('Tabellenänderung', '', rtexts_b[idx][:500], 0)
                         tbl_el.append(tr_el)
 
             body.append(tbl_el)
@@ -1569,7 +1569,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
 
         elif ctype in ('Löschung', 'Verschoben (Quelle)'):
             color = CLR_MOVE if 'Verschoben' in ctype else CLR_DEL
-            run = paragraph.add_run(old[:200])
+            run = paragraph.add_run(old[:1000])
             run.font.size = Pt(8)
             run.font.color.rgb = color
             run.font.strike = True
@@ -1581,7 +1581,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
 
         elif ctype in ('Einfügung', 'Verschoben (Ziel)'):
             color = CLR_MOVE if 'Verschoben' in ctype else CLR_INS
-            run = paragraph.add_run(new[:200])
+            run = paragraph.add_run(new[:1000])
             run.font.size = Pt(8)
             run.font.color.rgb = color
             run.font.underline = True
@@ -1592,7 +1592,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
                 tag_run.font.italic = True
         elif ctype == 'Formatierung':
             # Show the text context in normal style
-            text_preview = (old or new or '')[:120]
+            text_preview = (old or new or '')[:500]
             if text_preview:
                 run = paragraph.add_run(text_preview)
                 run.font.size = Pt(8)
@@ -1757,7 +1757,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
         # Alter Text — plain, with strikethrough for deletions
         old_para = row[2].paragraphs[0]
         old_para.clear()
-        old_text = change['old'][:200] if change['old'] else '—'
+        old_text = change['old'][:1000] if change['old'] else '—'
         if change['type'] in ('Löschung', 'Verschoben (Quelle)'):
             color = CLR_MOVE if 'Verschoben' in change['type'] else CLR_DEL
             r = old_para.add_run(old_text)
@@ -1914,7 +1914,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
                 'changed': ('FFF8E1', RGBColor(0xE6, 0x5C, 0x00)),
             }
 
-            for idx, ic in enumerate(changed_images[:100], 1):
+            for idx, ic in enumerate(changed_images, 1):
                 row = img_table.add_row().cells
                 row[0].text = str(idx)
                 row[1].text = ic['name']
@@ -2281,23 +2281,23 @@ def _generate_xlsx_redline(filepath_a, filepath_b, tmpdir):
                             if text_a != text_b:
                                 cell_ref = f'{tbl_label}, Zeile {a_ri + 1}, Zelle {ci + 1}'
                                 record_change('Tabellenänderung',
-                                              f'{cell_ref}: {text_a[:100]}',
-                                              f'{cell_ref}: {text_b[:100]}')
+                                              f'{cell_ref}: {text_a[:500]}',
+                                              f'{cell_ref}: {text_b[:500]}')
                 elif rtag == 'replace':
                     for idx in range(ri1, ri2):
                         record_change('Tabellenänderung',
-                                      f'{tbl_label}, Zeile {idx + 1}: {rtexts_a_rep[idx][:100]}', '')
+                                      f'{tbl_label}, Zeile {idx + 1}: {rtexts_a_rep[idx][:500]}', '')
                     for idx in range(rj1, rj2):
                         record_change('Tabellenänderung',
-                                      '', f'{tbl_label}, Zeile {idx + 1}: {rtexts_b_rep[idx][:100]}')
+                                      '', f'{tbl_label}, Zeile {idx + 1}: {rtexts_b_rep[idx][:500]}')
                 elif rtag == 'delete':
                     for idx in range(ri1, ri2):
                         record_change('Tabellenänderung',
-                                      f'{tbl_label}, Zeile {idx + 1}: {rtexts_a_rep[idx][:100]}', '')
+                                      f'{tbl_label}, Zeile {idx + 1}: {rtexts_a_rep[idx][:500]}', '')
                 elif rtag == 'insert':
                     for idx in range(rj1, rj2):
                         record_change('Tabellenänderung',
-                                      '', f'{tbl_label}, Zeile {idx + 1}: {rtexts_b_rep[idx][:100]}')
+                                      '', f'{tbl_label}, Zeile {idx + 1}: {rtexts_b_rep[idx][:500]}')
 
     type_counts = Counter(c['type'] for c in all_changes)
     for i, (ctype, count) in enumerate(type_counts.most_common()):
@@ -2318,23 +2318,19 @@ def _generate_xlsx_redline(filepath_a, filepath_b, tmpdir):
         c.fill = PatternFill(start_color='FF1565C0', end_color='FF1565C0', fill_type='solid')
         c.alignment = Alignment(horizontal='center')
 
-    for i, change in enumerate(all_changes[:500]):  # Limit to 500 rows
+    for i, change in enumerate(all_changes):
         r = detail_row + 2 + i
         ws_summary.cell(r, 1, change['sheet'])
         ws_summary.cell(r, 2, change['cell'])
         ws_summary.cell(r, 3, change['type'])
-        old_cell = ws_summary.cell(r, 4, change['old'][:100] if change['old'] else '')
+        old_cell = ws_summary.cell(r, 4, change['old'][:500] if change['old'] else '')
         old_cell.font = FONTS['deleted'] if change['old'] else FONTS['normal']
-        new_cell = ws_summary.cell(r, 5, change['new'][:100] if change['new'] else '')
+        new_cell = ws_summary.cell(r, 5, change['new'][:500] if change['new'] else '')
         new_cell.font = FONTS['inserted'] if change['new'] else FONTS['normal']
 
     # Auto-width columns
     for col_letter in ['A', 'B', 'C', 'D', 'E', 'F']:
         ws_summary.column_dimensions[col_letter].width = 20
-
-    if len(all_changes) > 500:
-        r = detail_row + 502
-        ws_summary.cell(r, 1, f'... und {len(all_changes) - 500} weitere Änderungen').font = Font(italic=True, color='999999')
 
     out_path = os.path.join(tmpdir, 'redline.xlsx')
     wb_b.save(out_path)
@@ -2400,8 +2396,8 @@ def _generate_pptx_redline(filepath_a, filepath_b, tmpdir):
 
         if tag == 'replace':
             for idx in range(max(i2 - i1, j2 - j1)):
-                old_t = texts_a[i1 + idx][:80] if (i1 + idx) < i2 else ''
-                new_t = texts_b[j1 + idx][:80] if (j1 + idx) < j2 else ''
+                old_t = texts_a[i1 + idx][:500] if (i1 + idx) < i2 else ''
+                new_t = texts_b[j1 + idx][:500] if (j1 + idx) < j2 else ''
                 p = tf.add_paragraph() if tf.paragraphs[0].text else tf.paragraphs[0]
                 p.font.size = Pt(10)
                 run_label = p.add_run()
@@ -2683,7 +2679,7 @@ def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir, pdfa=False)
         change_num[0] += 1
         all_changes.append({
             'num': change_num[0], 'type': ctype,
-            'old': (old or '')[:100], 'new': (new or '')[:100]
+            'old': (old or '')[:500], 'new': (new or '')[:500]
         })
 
     sm = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
@@ -2800,7 +2796,7 @@ def _generate_redline_pdf(filepath_a, filepath_b, file_type, tmpdir, pdfa=False)
         ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
         ('LEFTPADDING', (0, 0), (-1, -1), 4),
     ]
-    for i, change in enumerate(all_changes[:150]):
+    for i, change in enumerate(all_changes):
         old_d = escape(change['old']) if change['old'] else '—'
         new_d = escape(change['new']) if change['new'] else '—'
         changes_data.append([
@@ -3758,25 +3754,25 @@ def ai_analyze(doc_id, version_a, version_b):
                     old = lines_a[i1 + idx] if (i1 + idx) < i2 else ''
                     new = lines_b[j1 + idx] if (j1 + idx) < j2 else ''
                     if old and new:
-                        changes.append({'type': 'Geändert', 'old': old[:300],
-                                        'new': new[:300], 'para': para_num})
+                        changes.append({'type': 'Geändert', 'old': old[:500],
+                                        'new': new[:500], 'para': para_num})
                     elif old:
-                        changes.append({'type': 'Gelöscht', 'old': old[:300],
+                        changes.append({'type': 'Gelöscht', 'old': old[:500],
                                         'new': '', 'para': para_num})
                     else:
                         changes.append({'type': 'Eingefügt', 'old': '',
-                                        'new': new[:300], 'para': para_num})
+                                        'new': new[:500], 'para': para_num})
             elif tag == 'delete':
                 for idx in range(i1, i2):
                     para_num += 1
                     changes.append({'type': 'Gelöscht',
-                                    'old': lines_a[idx][:300],
+                                    'old': lines_a[idx][:500],
                                     'new': '', 'para': para_num})
             elif tag == 'insert':
                 for idx in range(j1, j2):
                     para_num += 1
                     changes.append({'type': 'Eingefügt', 'old': '',
-                                    'new': lines_b[idx][:300],
+                                    'new': lines_b[idx][:500],
                                     'para': para_num})
 
         if not changes:
@@ -3797,26 +3793,13 @@ def ai_analyze(doc_id, version_a, version_b):
             if len(combined) < 3:
                 continue
             ch_copy = dict(ch)
-            ch_copy['old'] = old[:300]
-            ch_copy['new'] = new[:300]
+            ch_copy['old'] = old[:500]
+            ch_copy['new'] = new[:500]
             significant_changes.append(ch_copy)
 
-        # Send as many changes as possible for comprehensive analysis
-        if provider == 'claude':
-            max_changes = 500
-        else:
-            max_changes = 200
-
-        if len(significant_changes) > max_changes:
-            significant_changes.sort(
-                key=lambda c: len(c.get('old', '')) + len(c.get('new', '')),
-                reverse=True)
-            analysis_changes = significant_changes[:max_changes]
-            analysis_changes.sort(key=lambda c: c.get('para', 0))
-            truncated = True
-        else:
-            analysis_changes = significant_changes
-            truncated = len(changes) > len(significant_changes)
+        # Send ALL changes — thoroughness over speed
+        analysis_changes = significant_changes
+        truncated = len(changes) > len(significant_changes)
 
         result = analyze_changes(
             analysis_changes,

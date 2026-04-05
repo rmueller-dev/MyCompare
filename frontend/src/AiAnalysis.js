@@ -80,9 +80,9 @@ function IssueTable({ section }) {
 }
 
 const CLAUDE_MODEL_NAMES = {
-  'claude-sonnet-4-20250514': 'Claude Sonnet 4 (~6 Cent)',
-  'claude-haiku-4-5-20251001': 'Claude Haiku 4.5 (~2 Cent)',
-  'claude-opus-4-20250514': 'Claude Opus 4 (~30 Cent)',
+  'claude-sonnet-4-20250514': 'Claude Sonnet 4 — Empfohlen',
+  'claude-opus-4-20250514': 'Claude Opus 4 — Premium',
+  'claude-haiku-4-5-20251001': 'Claude Haiku 4.5 — Schnell',
 };
 
 export default function AiAnalysis({ docId, docName, versionA, versionB, onClose }) {
@@ -397,12 +397,12 @@ export default function AiAnalysis({ docId, docName, versionA, versionB, onClose
           {/* LOADING */}
           {step === 'loading' && (() => {
             const isClaude = provider === 'claude';
-            const maxTime = isClaude ? 30 : 180;
+            const maxTime = isClaude ? 180 : 300;
             const pct = Math.min(95, Math.round((elapsed / maxTime) * 100));
             const mins = Math.floor(elapsed / 60);
             const secs = elapsed % 60;
             const phases = isClaude
-              ? [[0,'Änderungen werden aufbereitet...'],[5,'Anfrage an Claude API...'],[15,'AI analysiert die Klauseln...'],[50,'Issue List wird erstellt...'],[80,'Antwort wird verarbeitet...']]
+              ? [[0,'Änderungen werden in Batches aufgeteilt...'],[5,'Batch 1 wird an Claude gesendet...'],[15,'Klauseln werden analysiert...'],[30,'Weitere Batches werden verarbeitet...'],[50,'Risikobewertung aller Änderungen...'],[70,'Issue List wird zusammengeführt...'],[85,'Ergebnisse werden aufbereitet...']]
               : [[0,'Änderungen werden aufbereitet...'],[10,'Prompt wird an LLM gesendet...'],[20,'AI analysiert die Klauseln...'],[40,'Risikobewertung läuft...'],[60,'Issue List wird strukturiert...'],[80,'Tabellen werden erstellt...'],[90,'Analyse wird abgeschlossen...']];
             const phase = [...phases].reverse().find(([p]) => pct >= p)?.[1] || phases[0][1];
             return (
@@ -417,8 +417,8 @@ export default function AiAnalysis({ docId, docName, versionA, versionB, onClose
                 </div>
                 <p className="text-center text-xs text-gray-400">
                   {isClaude
-                    ? `Geschätzt ca. 10-20 Sekunden mit ${CLAUDE_MODEL_NAMES[model] || model}`
-                    : `Geschätzt ca. 2-3 Minuten mit ${model || 'qwen2.5:14b'}`
+                    ? `Gründliche Analyse in Batches — kann 1-3 Minuten dauern (${CLAUDE_MODEL_NAMES[model] || model})`
+                    : `Geschätzt ca. 3-5 Minuten mit ${model || 'qwen2.5:14b'}`
                   }
                 </p>
               </div>
@@ -444,7 +444,7 @@ export default function AiAnalysis({ docId, docName, versionA, versionB, onClose
                   <span className={result.provider === 'claude' ? 'text-violet-300' : ''}>
                     {result.provider === 'claude' ? `Claude (${CLAUDE_MODEL_NAMES[result.model] || result.model})` : result.model}
                   </span>
-                  {' '}| {result.change_count} Änderungen
+                  {' '}| {result.change_count} Änderungen{result.batches > 1 ? ` (${result.batches} Batches)` : ''}
                 </p>
               </div>
 

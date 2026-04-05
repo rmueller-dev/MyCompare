@@ -14,9 +14,9 @@ DEFAULT_MODEL = "qwen2.5:14b"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MODELS = {
-    "claude-sonnet-4-20250514": "Claude Sonnet 4",
-    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
-    "claude-opus-4-20250514": "Claude Opus 4",
+    "claude-sonnet-4-20250514": "Claude Sonnet 4 (Empfohlen)",
+    "claude-opus-4-20250514": "Claude Opus 4 (Premium)",
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5 (Schnell)",
 }
 
 # Persistent config file for API key (stored next to the database)
@@ -178,9 +178,11 @@ Antworte NUR mit validem JSON in exakt diesem Format:
 
 Regeln:
 - severity: Nur "KRITISCH", "WICHTIG", "NEUTRAL" oder "VORTEILHAFT"
-- Erstelle einen VOLLSTÄNDIGEN Überblick über ALLE Änderungen — JEDE Änderung muss in einem Issue erfasst sein
-- Erstelle so viele Abschnitte und Issues wie nötig, um alle Änderungen abzudecken
-- Nur wirklich eng verwandte Änderungen (z.B. gleiche Klausel, gleicher Absatz) zu einem Issue zusammenfassen
+- JEDE einzelne Änderung MUSS als eigenes Issue erfasst werden — KEINE Änderung auslassen
+- Erstelle so viele Abschnitte und Issues wie nötig — 50, 100 oder 200 Issues sind völlig normal
+- NICHT zusammenfassen: Jede Änderung = ein separates Issue mit eigenem Ref, eigener Bewertung
+- Kategorien: rechtliche Issues, wirtschaftliche Issues, finanzielle Issues, Haftungsrisiken, Definitionen, Verfahrensfragen
+- old_text und new_text: Gib den relevanten Originaltext an (nicht nur zusammenfassen)
 - Bewerte aus Sicht von {client_party}
 - Sei präzise und praxisorientiert
 - Antworte auf Deutsch
@@ -245,6 +247,151 @@ def _build_result(raw_text: str, use_model: str, changes: List[Dict],
         }
 
 
+def _call_claude_api(api_key: str, model: str, prompt: str, max_tokens: int = 16384) -> Dict:
+    """Make a single Claude API call. Returns parsed response or error dict."""
+    try:
+        response = requests.post(
+            CLAUDE_API_URL,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+            },
+            timeout=300,
+        )
+
+        if response.status_code == 401:
+            return {"error": "Ungültiger API-Key. Bitte prüfen Sie Ihren Anthropic API-Key."}
+        if response.status_code == 429:
+            import time
+            time.sleep(5)
+            # Retry once
+            response = requests.post(
+                CLAUDE_API_URL,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.2,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=300,
+            )
+            if response.status_code != 200:
+                return {"error": "Rate Limit erreicht. Bitte warten Sie einen Moment."}
+        if response.status_code != 200:
+            error_detail = ""
+            try:
+                error_detail = response.json().get("error", {}).get("message", "")
+            except Exception:
+                pass
+            return {"error": f"Claude API-Fehler: HTTP {response.status_code}"
+                             + (f" — {error_detail}" if error_detail else "")}
+
+        data = response.json()
+        raw_text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                raw_text += block.get("text", "")
+
+        return {"raw_text": raw_text}
+
+    except requests.exceptions.Timeout:
+        return {"error": "Zeitüberschreitung bei der Claude API."}
+    except Exception as e:
+        return {"error": f"Fehler bei der Claude-Analyse: {str(e)}"}
+
+
+def _merge_batch_results(batch_results: List[Dict], document_context: str,
+                         client_party: str) -> Dict:
+    """Merge multiple batch issue list results into one comprehensive list."""
+    all_sections = []
+    total_critical = 0
+    total_important = 0
+    total_neutral = 0
+    total_favorable = 0
+    all_key_risks = []
+    all_strategies = []
+
+    section_counter = 0
+    issue_counter = 0
+
+    for parsed in batch_results:
+        if not parsed or "sections" not in parsed:
+            continue
+
+        for section in parsed.get("sections", []):
+            section_counter += 1
+            section["number"] = _roman(section_counter)
+
+            # Renumber issues
+            for issue in section.get("issues", []):
+                issue_counter += 1
+                issue["ref"] = f"{section_counter}.{issue_counter}"
+
+            all_sections.append(section)
+
+        summary = parsed.get("executive_summary", {})
+        total_critical += summary.get("critical", 0)
+        total_important += summary.get("important", 0)
+        total_neutral += summary.get("neutral", 0)
+        total_favorable += summary.get("favorable", 0)
+        all_key_risks.extend(summary.get("key_risks", []))
+        strategy = summary.get("strategy", "")
+        if strategy:
+            all_strategies.append(strategy)
+
+    # Deduplicate key risks
+    seen_risks = set()
+    unique_risks = []
+    for r in all_key_risks:
+        r_lower = r.lower().strip()
+        if r_lower not in seen_risks:
+            seen_risks.add(r_lower)
+            unique_risks.append(r)
+
+    total_issues = total_critical + total_important + total_neutral + total_favorable
+
+    return {
+        "title": f"ISSUE LIST — {document_context or 'Vertrag'}",
+        "subtitle": f"Mandant: {client_party}",
+        "sections": all_sections,
+        "executive_summary": {
+            "total_issues": total_issues,
+            "critical": total_critical,
+            "important": total_important,
+            "neutral": total_neutral,
+            "favorable": total_favorable,
+            "key_risks": unique_risks[:10],
+            "strategy": " ".join(all_strategies) if all_strategies else "",
+        },
+    }
+
+
+def _roman(n: int) -> str:
+    """Convert integer to Roman numeral."""
+    vals = [(1000,'M'),(900,'CM'),(500,'D'),(400,'CD'),(100,'C'),(90,'XC'),
+            (50,'L'),(40,'XL'),(10,'X'),(9,'IX'),(5,'V'),(4,'IV'),(1,'I')]
+    result = ''
+    for val, numeral in vals:
+        while n >= val:
+            result += numeral
+            n -= val
+    return result
+
+
 def analyze_changes_claude(
     changes: List[Dict],
     client_party: str,
@@ -252,7 +399,7 @@ def analyze_changes_claude(
     model: str = None,
     client_version: str = "a",
 ) -> Dict[str, Any]:
-    """Send changes to Claude API for analysis."""
+    """Send changes to Claude API for analysis, using batching for thoroughness."""
     api_key = get_api_key()
     if not api_key:
         return {
@@ -263,71 +410,69 @@ def analyze_changes_claude(
 
     use_model = model or CLAUDE_DEFAULT_MODEL
 
-    prompt = _build_prompt(changes, client_party, document_context,
-                           client_version=client_version, provider="claude")
+    # Split changes into batches of ~30 for thorough analysis
+    BATCH_SIZE = 30
+    batches = []
+    for i in range(0, len(changes), BATCH_SIZE):
+        batches.append(changes[i:i + BATCH_SIZE])
 
-    # Scale max_tokens based on number of changes
-    max_tokens = min(16384, max(8192, len(changes) * 120))
+    if len(batches) == 0:
+        return {"status": "error", "error": "Keine Änderungen zu analysieren."}
 
-    try:
-        response = requests.post(
-            CLAUDE_API_URL,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": use_model,
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-            },
-            timeout=120,
-        )
+    # Process each batch
+    batch_results = []
+    raw_texts = []
+    for batch_idx, batch in enumerate(batches):
+        prompt = _build_prompt(batch, client_party, document_context,
+                               client_version=client_version, provider="claude")
 
-        if response.status_code == 401:
-            return {
-                "status": "error",
-                "error": "Ungültiger API-Key. Bitte prüfen Sie Ihren Anthropic API-Key.",
-            }
-        if response.status_code == 429:
-            return {
-                "status": "error",
-                "error": "Rate Limit erreicht. Bitte warten Sie einen Moment.",
-            }
-        if response.status_code != 200:
-            error_detail = ""
-            try:
-                error_detail = response.json().get("error", {}).get("message", "")
-            except Exception:
-                pass
-            return {
-                "status": "error",
-                "error": f"Claude API-Fehler: HTTP {response.status_code}"
-                         + (f" — {error_detail}" if error_detail else ""),
-            }
+        # Add batch context to prompt
+        if len(batches) > 1:
+            batch_note = (f"\n\nHINWEIS: Dies ist Teil {batch_idx + 1} von {len(batches)} "
+                          f"(Änderungen {batch_idx * BATCH_SIZE + 1} bis "
+                          f"{min((batch_idx + 1) * BATCH_SIZE, len(changes))} "
+                          f"von {len(changes)} gesamt). "
+                          f"Erstelle für JEDE einzelne Änderung ein separates Issue.")
+            prompt += batch_note
 
-        data = response.json()
-        raw_text = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                raw_text += block.get("text", "")
+        result = _call_claude_api(api_key, use_model, prompt, max_tokens=16384)
 
-        return _build_result(raw_text, use_model, changes, client_party, "claude")
+        if "error" in result:
+            return {"status": "error", "error": result["error"]}
 
-    except requests.exceptions.Timeout:
+        raw_text = result.get("raw_text", "")
+        raw_texts.append(raw_text)
+
+        parsed = _parse_json_response(raw_text)
+        if parsed and "sections" in parsed:
+            batch_results.append(parsed)
+
+    if not batch_results:
+        # No structured results — return raw text fallback
         return {
-            "status": "error",
-            "error": "Zeitüberschreitung bei der Claude API.",
+            "status": "ok",
+            "structured": False,
+            "analysis": "\n\n---\n\n".join(raw_texts),
+            "model": use_model,
+            "provider": "claude",
+            "change_count": len(changes),
+            "client_party": client_party,
         }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": f"Fehler bei der Claude-Analyse: {str(e)}",
-        }
+
+    # Merge all batch results into one comprehensive issue list
+    merged = _merge_batch_results(batch_results, document_context, client_party)
+
+    return {
+        "status": "ok",
+        "structured": True,
+        "issue_list": merged,
+        "raw": "\n\n---\n\n".join(raw_texts),
+        "model": use_model,
+        "provider": "claude",
+        "change_count": len(changes),
+        "client_party": client_party,
+        "batches": len(batches),
+    }
 
 
 def analyze_changes(
@@ -367,7 +512,7 @@ def analyze_changes(
     prompt = _build_prompt(changes, client_party, document_context,
                            client_version=client_version, provider="ollama")
 
-    num_predict = min(16384, max(4096, len(changes) * 80))
+    num_predict = min(32768, max(8192, len(changes) * 100))
 
     try:
         response = requests.post(
@@ -379,7 +524,7 @@ def analyze_changes(
                 "options": {
                     "temperature": 0.2,
                     "num_predict": num_predict,
-                    "num_ctx": 16384,
+                    "num_ctx": 32768,
                 },
             },
             timeout=3600,
