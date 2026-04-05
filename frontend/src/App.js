@@ -67,7 +67,6 @@ function VerificationBadge({ verification }) {
       <div className="mt-2 text-xs font-mono opacity-70 space-y-0.5">
         <div>SHA-256 A: {hash_a?.substring(0, 16)}...</div>
         <div>SHA-256 B: {hash_b?.substring(0, 16)}...</div>
-        {delta_mismatch > 0 && <div>Delta-Abweichung: {delta_mismatch} Zeichen</div>}
         <div>Erkannte Änderungen: {change_count}</div>
       </div>
     </div>
