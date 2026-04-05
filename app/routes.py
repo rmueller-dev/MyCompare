@@ -3,7 +3,7 @@ import os
 import uuid
 from flask import Blueprint, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
-from .models import SessionLocal, Document, Version, RenderingSet, STORAGE_DIR
+from .models import SessionLocal, Document, Version, RenderingSet, Folder, STORAGE_DIR
 from .extractors import extract
 from .diff_engine import compute_diff
 from .image_diff import extract_images, compare_images
@@ -25,7 +25,11 @@ def get_file_type(filename):
 def list_documents():
     session = SessionLocal()
     try:
-        docs = session.query(Document).order_by(Document.created_at.desc()).all()
+        show_archived = request.args.get('archived', 'false') == 'true'
+        q = session.query(Document)
+        if not show_archived:
+            q = q.filter((Document.archived == False) | (Document.archived == None))  # noqa: E712
+        docs = q.order_by(Document.created_at.desc()).all()
         return jsonify([d.to_dict() for d in docs])
     finally:
         session.close()
@@ -133,6 +137,179 @@ def delete_document(doc_id):
         session.delete(doc)
         session.commit()
         return jsonify({'ok': True})
+    finally:
+        session.close()
+
+
+# ─── FOLDERS ────────────────────────────────────────────────────────────
+
+@api.route('/folders', methods=['GET'])
+def list_folders():
+    session = SessionLocal()
+    try:
+        show_archived = request.args.get('archived', 'false') == 'true'
+        q = session.query(Folder)
+        if not show_archived:
+            q = q.filter((Folder.archived == False) | (Folder.archived == None))  # noqa: E712
+        folders = q.order_by(Folder.name).all()
+        return jsonify([f.to_dict() for f in folders])
+    finally:
+        session.close()
+
+
+@api.route('/folders', methods=['POST'])
+def create_folder():
+    data = request.get_json() or {}
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'Ordnername fehlt'}), 400
+    parent_id = data.get('parent_id')
+    session = SessionLocal()
+    try:
+        folder = Folder(name=name, parent_id=parent_id)
+        session.add(folder)
+        session.commit()
+        session.refresh(folder)
+        return jsonify(folder.to_dict()), 201
+    finally:
+        session.close()
+
+
+@api.route('/folders/<int:folder_id>', methods=['PUT'])
+def update_folder(folder_id):
+    data = request.get_json() or {}
+    session = SessionLocal()
+    try:
+        folder = session.query(Folder).get(folder_id)
+        if not folder:
+            return jsonify({'error': 'Ordner nicht gefunden'}), 404
+        if 'name' in data:
+            folder.name = data['name'].strip()
+        if 'parent_id' in data:
+            folder.parent_id = data['parent_id']
+        session.commit()
+        session.refresh(folder)
+        return jsonify(folder.to_dict())
+    finally:
+        session.close()
+
+
+@api.route('/folders/<int:folder_id>', methods=['DELETE'])
+def delete_folder(folder_id):
+    session = SessionLocal()
+    try:
+        folder = session.query(Folder).get(folder_id)
+        if not folder:
+            return jsonify({'error': 'Ordner nicht gefunden'}), 404
+        # Move documents in this folder to root (no folder)
+        for doc in folder.documents:
+            doc.folder_id = None
+        # Move child folders to parent
+        children = session.query(Folder).filter_by(parent_id=folder_id).all()
+        for child in children:
+            child.parent_id = folder.parent_id
+        session.delete(folder)
+        session.commit()
+        return jsonify({'ok': True})
+    finally:
+        session.close()
+
+
+# ─── ARCHIVE / MOVE / SEARCH ───────────────────────────────────────────
+
+@api.route('/documents/<int:doc_id>/archive', methods=['POST'])
+def archive_document(doc_id):
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        if not doc:
+            return jsonify({'error': 'Nicht gefunden'}), 404
+        doc.archived = True
+        session.commit()
+        return jsonify({'ok': True, 'archived': True})
+    finally:
+        session.close()
+
+
+@api.route('/documents/<int:doc_id>/unarchive', methods=['POST'])
+def unarchive_document(doc_id):
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        if not doc:
+            return jsonify({'error': 'Nicht gefunden'}), 404
+        doc.archived = False
+        session.commit()
+        return jsonify({'ok': True, 'archived': False})
+    finally:
+        session.close()
+
+
+@api.route('/documents/<int:doc_id>/move', methods=['POST'])
+def move_document(doc_id):
+    data = request.get_json() or {}
+    folder_id = data.get('folder_id')  # None = move to root
+    session = SessionLocal()
+    try:
+        doc = session.query(Document).get(doc_id)
+        if not doc:
+            return jsonify({'error': 'Nicht gefunden'}), 404
+        if folder_id is not None:
+            folder = session.query(Folder).get(folder_id)
+            if not folder:
+                return jsonify({'error': 'Ordner nicht gefunden'}), 404
+        doc.folder_id = folder_id
+        session.commit()
+        return jsonify({'ok': True, 'folder_id': folder_id})
+    finally:
+        session.close()
+
+
+@api.route('/folders/<int:folder_id>/archive', methods=['POST'])
+def archive_folder(folder_id):
+    session = SessionLocal()
+    try:
+        folder = session.query(Folder).get(folder_id)
+        if not folder:
+            return jsonify({'error': 'Ordner nicht gefunden'}), 404
+        folder.archived = True
+        # Also archive all documents in this folder
+        for doc in folder.documents:
+            doc.archived = True
+        session.commit()
+        return jsonify({'ok': True})
+    finally:
+        session.close()
+
+
+@api.route('/folders/<int:folder_id>/unarchive', methods=['POST'])
+def unarchive_folder(folder_id):
+    session = SessionLocal()
+    try:
+        folder = session.query(Folder).get(folder_id)
+        if not folder:
+            return jsonify({'error': 'Ordner nicht gefunden'}), 404
+        folder.archived = False
+        for doc in folder.documents:
+            doc.archived = False
+        session.commit()
+        return jsonify({'ok': True})
+    finally:
+        session.close()
+
+
+@api.route('/search', methods=['GET'])
+def search_documents():
+    query = request.args.get('q', '').strip()
+    if not query or len(query) < 2:
+        return jsonify([])
+    session = SessionLocal()
+    try:
+        docs = session.query(Document).filter(
+            Document.name.ilike(f'%{query}%'),
+            (Document.archived == False) | (Document.archived == None),  # noqa: E712
+        ).order_by(Document.created_at.desc()).limit(20).all()
+        return jsonify([d.to_dict() for d in docs])
     finally:
         session.close()
 

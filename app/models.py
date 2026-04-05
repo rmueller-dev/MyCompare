@@ -13,19 +13,46 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 
+class Folder(Base):
+    __tablename__ = 'folders'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(500), nullable=False)
+    parent_id = Column(Integer, ForeignKey('folders.id'), nullable=True)
+    archived = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    children = relationship('Folder', backref='parent', remote_side=[id],
+                            foreign_keys=[parent_id], lazy='select')
+    documents = relationship('Document', back_populates='folder')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'parent_id': self.parent_id,
+            'archived': self.archived,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'document_count': len(self.documents) if self.documents else 0,
+        }
+
+
 class Document(Base):
     __tablename__ = 'documents'
     id = Column(Integer, primary_key=True)
     name = Column(String(500), nullable=False)
     file_type = Column(String(10), nullable=False)  # docx, xlsx, pptx, pdf
+    folder_id = Column(Integer, ForeignKey('folders.id'), nullable=True)
+    archived = Column(Boolean, default=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     versions = relationship('Version', back_populates='document', order_by='Version.version_number')
+    folder = relationship('Folder', back_populates='documents')
 
     def to_dict(self):
         return {
             'id': self.id,
             'name': self.name,
             'file_type': self.file_type,
+            'folder_id': self.folder_id,
+            'archived': self.archived,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'versions': [v.to_dict() for v in self.versions],
         }
@@ -91,6 +118,16 @@ class RenderingSet(Base):
 def init_db():
     os.makedirs(STORAGE_DIR, exist_ok=True)
     Base.metadata.create_all(engine)
+
+    # Migrate: add new columns if they don't exist yet
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    doc_cols = [c['name'] for c in insp.get_columns('documents')]
+    with engine.begin() as conn:
+        if 'folder_id' not in doc_cols:
+            conn.execute(text('ALTER TABLE documents ADD COLUMN folder_id INTEGER REFERENCES folders(id)'))
+        if 'archived' not in doc_cols:
+            conn.execute(text('ALTER TABLE documents ADD COLUMN archived BOOLEAN DEFAULT 0'))
 
     # Create default rendering sets if none exist
     session = SessionLocal()
