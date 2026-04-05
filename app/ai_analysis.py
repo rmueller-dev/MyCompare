@@ -159,7 +159,7 @@ def analyze_changes(
                     "num_predict": 4096,
                 },
             },
-            timeout=300,  # 5 min timeout for large analyses
+            timeout=3600,  # 60 min timeout for large analyses
         )
 
         if response.status_code != 200:
