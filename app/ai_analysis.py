@@ -411,7 +411,7 @@ def analyze_changes_claude(
     use_model = model or CLAUDE_DEFAULT_MODEL
 
     # Split changes into batches of ~30 for thorough analysis
-    BATCH_SIZE = 30
+    BATCH_SIZE = 50
     batches = []
     for i in range(0, len(changes), BATCH_SIZE):
         batches.append(changes[i:i + BATCH_SIZE])
@@ -419,10 +419,15 @@ def analyze_changes_claude(
     if len(batches) == 0:
         return {"status": "error", "error": "Keine Änderungen zu analysieren."}
 
-    # Process each batch
+    # Process each batch with delays to avoid rate limits
     batch_results = []
     raw_texts = []
     for batch_idx, batch in enumerate(batches):
+        # Wait between batches to avoid rate limiting
+        if batch_idx > 0:
+            import time
+            time.sleep(3)
+
         prompt = _build_prompt(batch, client_party, document_context,
                                client_version=client_version, provider="claude")
 
@@ -435,10 +440,20 @@ def analyze_changes_claude(
                           f"Erstelle für JEDE einzelne Änderung ein separates Issue.")
             prompt += batch_note
 
-        result = _call_claude_api(api_key, use_model, prompt, max_tokens=16384)
+        # Retry up to 3 times on rate limit
+        result = None
+        for attempt in range(3):
+            result = _call_claude_api(api_key, use_model, prompt, max_tokens=16384)
+            if "error" in result and "Rate Limit" in result["error"]:
+                import time
+                time.sleep(10 * (attempt + 1))  # 10s, 20s, 30s
+                continue
+            break
 
-        if "error" in result:
-            return {"status": "error", "error": result["error"]}
+        if result and "error" in result:
+            # If a batch fails, skip it and continue with others
+            raw_texts.append(f"[Batch {batch_idx + 1} fehlgeschlagen: {result['error']}]")
+            continue
 
         raw_text = result.get("raw_text", "")
         raw_texts.append(raw_text)
