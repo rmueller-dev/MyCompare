@@ -936,121 +936,87 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
     shutil.copy2(filepath_b, work_path)
     out_doc = DocxDocument(work_path)
 
-    # ── Merge footnotes from doc_a into out_doc ──
-    footnote_id_remap = {}
-    endnote_id_remap = {}
+    # ── Collect valid relationship IDs from out_doc ──
+    # Elements copied from doc_a may reference rIds (images, hyperlinks) that
+    # only exist in doc_a. We must strip these to prevent DOCX corruption.
+    out_doc_rids = set()
+    try:
+        for rel_key in out_doc.element.part.rels:
+            out_doc_rids.add(rel_key)
+    except Exception:
+        pass
 
-    def _merge_footnotes_from_a():
-        """Copy footnotes from doc_a into out_doc's footnote part, remapping IDs."""
-        try:
-            fn_part_a = None
-            for rel in doc_a.element.part.rels.values():
-                if 'footnotes' in rel.reltype:
-                    fn_part_a = rel.target_part
-                    break
-            if fn_part_a is None:
-                return
+    def _sanitize_element_from_a(el):
+        """Remove all references from a doc_a element that could corrupt out_doc.
 
-            fn_part_out = None
-            for rel in out_doc.element.part.rels.values():
-                if 'footnotes' in rel.reltype:
-                    fn_part_out = rel.target_part
-                    break
-            if fn_part_out is None:
-                return
+        Strips: footnoteReference, endnoteReference, drawings/images,
+        hyperlinks with broken rIds, and other relationship-dependent elements.
+        This is safer than trying to merge all parts from doc_a.
+        """
+        WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+        V_NS = 'urn:schemas-microsoft-com:vml'
+        O_NS = 'urn:schemas-microsoft-com:office:office'
 
-            root_a = etree.fromstring(fn_part_a.blob)
-            root_out = etree.fromstring(fn_part_out.blob)
-
-            # Find max footnote ID in out_doc
-            max_id = 0
-            for fn in root_out.findall(f'{{{W}}}footnote'):
-                fid = int(fn.get(f'{{{W}}}id', '0'))
-                max_id = max(max_id, fid)
-
-            # Copy footnotes from A (skip separator footnotes with id 0 and 1)
-            for fn in root_a.findall(f'{{{W}}}footnote'):
-                old_id = fn.get(f'{{{W}}}id', '0')
-                if old_id in ('0', '-1', '1'):
-                    continue  # Skip separator/continuation footnotes
-                max_id += 1
-                new_id = str(max_id)
-                footnote_id_remap[old_id] = new_id
-                fn.set(f'{{{W}}}id', new_id)
-                root_out.append(fn)
-
-            fn_part_out._blob = etree.tostring(root_out, xml_declaration=True,
-                                                 encoding='UTF-8', standalone=True)
-        except Exception:
-            pass
-
-    def _merge_endnotes_from_a():
-        """Copy endnotes from doc_a into out_doc's endnote part, remapping IDs."""
-        try:
-            en_part_a = None
-            for rel in doc_a.element.part.rels.values():
-                if 'endnotes' in rel.reltype:
-                    en_part_a = rel.target_part
-                    break
-            if en_part_a is None:
-                return
-
-            en_part_out = None
-            for rel in out_doc.element.part.rels.values():
-                if 'endnotes' in rel.reltype:
-                    en_part_out = rel.target_part
-                    break
-            if en_part_out is None:
-                return
-
-            root_a = etree.fromstring(en_part_a.blob)
-            root_out = etree.fromstring(en_part_out.blob)
-
-            # Find max endnote ID in out_doc
-            max_id = 0
-            for en in root_out.findall(f'{{{W}}}endnote'):
-                eid = int(en.get(f'{{{W}}}id', '0'))
-                max_id = max(max_id, eid)
-
-            # Copy endnotes from A (skip separator endnotes with id 0 and 1)
-            for en in root_a.findall(f'{{{W}}}endnote'):
-                old_id = en.get(f'{{{W}}}id', '0')
-                if old_id in ('0', '-1', '1'):
-                    continue
-                max_id += 1
-                new_id = str(max_id)
-                endnote_id_remap[old_id] = new_id
-                en.set(f'{{{W}}}id', new_id)
-                root_out.append(en)
-
-            en_part_out._blob = etree.tostring(root_out, xml_declaration=True,
-                                                 encoding='UTF-8', standalone=True)
-        except Exception:
-            pass
-
-    _merge_footnotes_from_a()
-    _merge_endnotes_from_a()
-
-    def remap_footnote_endnote_ids_in_element(el):
-        """Remap footnote/endnote reference IDs in elements copied from doc_a."""
+        # 1. Strip footnote references (point to footnotes part that belongs to doc_a)
         for fn_ref in el.findall(f'.//{{{W}}}footnoteReference'):
-            old_id = fn_ref.get(f'{{{W}}}id', '')
-            if old_id in footnote_id_remap:
-                fn_ref.set(f'{{{W}}}id', footnote_id_remap[old_id])
-            elif old_id not in ('0', '-1', '1'):
-                # Footnote wasn't merged — strip the reference to prevent corruption
-                parent = fn_ref.getparent()
-                if parent is not None:
-                    parent.remove(fn_ref)
+            parent = fn_ref.getparent()
+            if parent is not None:
+                parent.remove(fn_ref)
+
+        # 2. Strip endnote references
         for en_ref in el.findall(f'.//{{{W}}}endnoteReference'):
-            old_id = en_ref.get(f'{{{W}}}id', '')
-            if old_id in endnote_id_remap:
-                en_ref.set(f'{{{W}}}id', endnote_id_remap[old_id])
-            elif old_id not in ('0', '-1', '1'):
-                # Endnote wasn't merged — strip the reference to prevent corruption
-                parent = en_ref.getparent()
+            parent = en_ref.getparent()
+            if parent is not None:
+                parent.remove(en_ref)
+
+        # 3. Strip drawing elements (images, shapes - reference rIds for media)
+        for drawing in el.findall(f'.//{{{W}}}drawing'):
+            parent = drawing.getparent()
+            if parent is not None:
+                parent.remove(drawing)
+
+        # 4. Strip VML picture/object elements (legacy image format)
+        for pict in el.findall(f'.//{{{W}}}pict'):
+            parent = pict.getparent()
+            if parent is not None:
+                parent.remove(pict)
+
+        # 5. Strip OLE objects
+        for obj in el.findall(f'.//{{{W}}}object'):
+            parent = obj.getparent()
+            if parent is not None:
+                parent.remove(obj)
+
+        # 6. Handle hyperlinks: keep text runs but remove wrapper if rId is broken
+        for hyperlink in list(el.findall(f'.//{{{W}}}hyperlink')):
+            r_id = hyperlink.get(f'{{{R_NS}}}id', '')
+            if r_id and r_id not in out_doc_rids:
+                # Broken hyperlink - unwrap: move children up, remove wrapper
+                parent = hyperlink.getparent()
                 if parent is not None:
-                    parent.remove(en_ref)
+                    idx = list(parent).index(hyperlink)
+                    for child in list(hyperlink):
+                        hyperlink.remove(child)
+                        parent.insert(idx, child)
+                        idx += 1
+                    parent.remove(hyperlink)
+
+        # 7. Strip field codes that reference external elements (TOC, REF, etc.
+        #    can reference bookmarks/fields that don't exist in out_doc)
+        #    Keep simple field codes but remove complex cross-doc references
+
+        # 8. Strip numbering references that don't exist in out_doc
+        #    (complex SPAs have custom numbering schemes)
+        for numPr in el.findall(f'.//{{{W}}}numPr'):
+            numId_el = numPr.find(f'{{{W}}}numId')
+            if numId_el is not None:
+                num_val = numId_el.get(f'{{{W}}}val', '0')
+                # Keep numId 0 (no numbering), strip others from doc_a
+                # since we can't guarantee they exist in out_doc
+                if num_val != '0':
+                    parent = numPr.getparent()
+                    if parent is not None:
+                        parent.remove(numPr)
 
     body = out_doc.element.body
     # Remove all paragraphs and tables from body, but keep sectPr and other structural elements
@@ -1090,7 +1056,9 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                 elif old_idx is not None:
                     src_ppr = doc_a.paragraphs[old_idx]._element.find(f'{{{W}}}pPr')
                     if src_ppr is not None:
-                        p_el.append(etree.fromstring(etree.tostring(src_ppr)))
+                        ppr_copy = etree.fromstring(etree.tostring(src_ppr))
+                        _sanitize_element_from_a(ppr_copy)
+                        p_el.append(ppr_copy)
 
                 # Get run formatting from source documents
                 rpr_a = None
@@ -1139,14 +1107,14 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                                 remap_comment_ids_in_element(copied)
                                 p_el.append(copied)
                             elif local == 'r':
-                                # Copy field-code runs (fldChar, instrText, footnoteRef, endnoteRef)
+                                # Only copy field-code runs (fldChar, instrText)
+                                # Skip footnoteReference/endnoteReference — they reference
+                                # parts that don't exist in out_doc and cause corruption
                                 has_field = child.find(f'{{{W}}}fldChar') is not None
                                 has_instr = child.find(f'{{{W}}}instrText') is not None
-                                has_fnref = child.find(f'{{{W}}}footnoteReference') is not None
-                                has_enref = child.find(f'{{{W}}}endnoteReference') is not None
-                                if has_field or has_instr or has_fnref or has_enref:
+                                if has_field or has_instr:
                                     copied_run = etree.fromstring(etree.tostring(child))
-                                    remap_footnote_endnote_ids_in_element(copied_run)
+                                    _sanitize_element_from_a(copied_run)
                                     p_el.append(copied_run)
                     if new_idx is not None:
                         for child in doc_b.paragraphs[new_idx]._element:
@@ -1181,7 +1149,7 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                 # Copy full paragraph from doc_a (preserves comment refs, footnote refs, field codes)
                 p_el = etree.fromstring(etree.tostring(doc_a.paragraphs[idx]._element))
                 remap_comment_ids_in_element(p_el)
-                remap_footnote_endnote_ids_in_element(p_el)
+                _sanitize_element_from_a(p_el)
                 # Wrap all runs in deletion marks (collect first, then replace)
                 runs_with_pos = []
                 for r_el in p_el.findall(f'{{{W}}}r'):
@@ -1287,7 +1255,7 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
             # Entire table was deleted
             record_change('Tabellenänderung', f'{tbl_label}: Gesamte Tabelle gelöscht', '', 0)
             tbl_el = etree.fromstring(etree.tostring(tbl_a._tbl))
-            remap_footnote_endnote_ids_in_element(tbl_el)
+            _sanitize_element_from_a(tbl_el)
             _wrap_all_runs_in_element_as_del(tbl_el)
             for tr_el in tbl_el.findall(f'{{{W}}}tr'):
                 _mark_row_paragraph_marks_deleted(tr_el)
@@ -1390,7 +1358,7 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                 elif rtag == 'replace':
                     for idx in range(ri1, ri2):
                         tr_el = etree.fromstring(etree.tostring(tbl_a.rows[idx]._tr))
-                        remap_footnote_endnote_ids_in_element(tr_el)
+                        _sanitize_element_from_a(tr_el)
                         _wrap_all_runs_in_element_as_del(tr_el)
                         _mark_row_paragraph_marks_deleted(tr_el)
                         record_change('Tabellenänderung', rtexts_a[idx][:120], '', 0)
@@ -1405,7 +1373,7 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
                 elif rtag == 'delete':
                     for idx in range(ri1, ri2):
                         tr_el = etree.fromstring(etree.tostring(tbl_a.rows[idx]._tr))
-                        remap_footnote_endnote_ids_in_element(tr_el)
+                        _sanitize_element_from_a(tr_el)
                         _wrap_all_runs_in_element_as_del(tr_el)
                         _mark_row_paragraph_marks_deleted(tr_el)
                         record_change('Tabellenänderung', rtexts_a[idx][:120], '', 0)
