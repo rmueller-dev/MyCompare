@@ -88,7 +88,7 @@ function ViewModeToggle({ mode, setMode }) {
 }
 
 // ─── DOWNLOAD BUTTONS ───
-function DownloadButtons({ docId, docName, versionA, versionB, fileType, latestVersionId }) {
+function DownloadButtons({ docId, docName, changeCount, versionA, versionB, fileType, latestVersionId }) {
   const [showAi, setShowAi] = React.useState(false);
   if (!docId || !versionA || !versionB) return null;
 
@@ -205,6 +205,7 @@ function DownloadButtons({ docId, docName, versionA, versionB, fileType, latestV
         <AiAnalysis
           docId={docId}
           docName={docName}
+          changeCount={changeCount}
           versionA={versionA}
           versionB={versionB}
           onClose={() => setShowAi(false)}
@@ -280,6 +281,7 @@ function DiffView({ diffResult, compareOptions, onCompareOptionsChange, onRerunD
       <DownloadButtons
         docId={diffResult.document?.id}
         docName={diffResult.document?.name}
+        changeCount={verification?.change_count || 0}
         versionA={diffResult.version_a?.version_number}
         versionB={diffResult.version_b?.version_number}
         fileType={diffResult.document?.file_type}

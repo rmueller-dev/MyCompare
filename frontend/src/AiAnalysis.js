@@ -85,7 +85,7 @@ const CLAUDE_MODEL_NAMES = {
   'claude-haiku-4-5-20251001': 'Claude Haiku 4.5 — Schnell',
 };
 
-export default function AiAnalysis({ docId, docName, versionA, versionB, onClose }) {
+export default function AiAnalysis({ docId, docName, changeCount, versionA, versionB, onClose }) {
   const [step, setStep] = useState('form');
   const [clientParty, setClientParty] = useState('');
   const [clientVersion, setClientVersion] = useState('a');
@@ -397,29 +397,61 @@ export default function AiAnalysis({ docId, docName, versionA, versionB, onClose
           {/* LOADING */}
           {step === 'loading' && (() => {
             const isClaude = provider === 'claude';
-            const maxTime = isClaude ? 180 : 300;
-            const pct = Math.min(95, Math.round((elapsed / maxTime) * 100));
+            const numChanges = changeCount || 50;
+
+            // Realistic time estimate based on actual change count
+            // Claude: ~50 changes per batch, ~15s per batch + 3s pause between
+            // Ollama: all at once but slow generation, ~2s per change
+            let estimatedSeconds;
+            if (isClaude) {
+              const numBatches = Math.ceil(numChanges / 50);
+              estimatedSeconds = numBatches * 18 + 10; // 18s per batch (15s + 3s pause) + 10s overhead
+            } else {
+              estimatedSeconds = Math.max(120, numChanges * 2);
+            }
+
+            const pct = Math.min(95, Math.round((elapsed / estimatedSeconds) * 100));
             const mins = Math.floor(elapsed / 60);
             const secs = elapsed % 60;
-            const phases = isClaude
-              ? [[0,'Änderungen werden in Batches aufgeteilt...'],[5,'Batch 1 wird an Claude gesendet...'],[15,'Klauseln werden analysiert...'],[30,'Weitere Batches werden verarbeitet...'],[50,'Risikobewertung aller Änderungen...'],[70,'Issue List wird zusammengeführt...'],[85,'Ergebnisse werden aufbereitet...']]
-              : [[0,'Änderungen werden aufbereitet...'],[10,'Prompt wird an LLM gesendet...'],[20,'AI analysiert die Klauseln...'],[40,'Risikobewertung läuft...'],[60,'Issue List wird strukturiert...'],[80,'Tabellen werden erstellt...'],[90,'Analyse wird abgeschlossen...']];
-            const phase = [...phases].reverse().find(([p]) => pct >= p)?.[1] || phases[0][1];
+            const estMins = Math.ceil(estimatedSeconds / 60);
+            const remainSecs = Math.max(0, estimatedSeconds - elapsed);
+            const remainMins = Math.floor(remainSecs / 60);
+            const remainS = remainSecs % 60;
+
+            // Claude batch-aware phases
+            const numBatches = Math.ceil(numChanges / 50);
+            const secsPerBatch = estimatedSeconds / numBatches;
+            const currentBatch = Math.min(numBatches, Math.floor(elapsed / secsPerBatch) + 1);
+
+            let phase;
+            if (isClaude) {
+              if (pct < 3) phase = `${numChanges} Änderungen werden in ${numBatches} Batches aufgeteilt...`;
+              else if (pct < 90) phase = `Batch ${currentBatch} von ${numBatches} wird analysiert...`;
+              else phase = 'Issue List wird zusammengeführt...';
+            } else {
+              if (pct < 5) phase = 'Änderungen werden aufbereitet...';
+              else if (pct < 20) phase = 'Prompt wird an LLM gesendet...';
+              else if (pct < 50) phase = 'AI analysiert die Klauseln...';
+              else if (pct < 75) phase = 'Risikobewertung läuft...';
+              else if (pct < 90) phase = 'Issue List wird strukturiert...';
+              else phase = 'Analyse wird abgeschlossen...';
+            }
+
             return (
               <div className="py-8 space-y-6">
                 <div className="text-center">
                   <div className={`inline-block w-10 h-10 border-4 ${isClaude ? 'border-violet-200 border-t-violet-600' : 'border-blue-200 border-t-[#1F3864]'} rounded-full animate-spin mb-3`}></div>
                   <p className="text-gray-700 font-semibold">{phase}</p>
-                  <p className="text-gray-400 text-sm mt-1">{mins > 0 ? `${mins}:${secs.toString().padStart(2,'0')}` : `${secs}s`} vergangen</p>
+                  <p className="text-gray-400 text-sm mt-1">
+                    {mins > 0 ? `${mins}:${secs.toString().padStart(2,'0')}` : `${secs}s`} vergangen
+                    {remainSecs > 5 && <span className="ml-2">| ca. {remainMins > 0 ? `${remainMins}:${remainS.toString().padStart(2,'0')}` : `${remainSecs}s`} verbleibend</span>}
+                  </p>
                 </div>
                 <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
                   <div className={`h-full rounded-full transition-all duration-1000 ${isClaude ? 'bg-gradient-to-r from-violet-500 to-violet-600' : 'bg-gradient-to-r from-[#1F3864] to-[#2D5AA0]'}`} style={{width:`${pct}%`}}></div>
                 </div>
                 <p className="text-center text-xs text-gray-400">
-                  {isClaude
-                    ? `Gründliche Analyse in Batches — kann 1-3 Minuten dauern (${CLAUDE_MODEL_NAMES[model] || model})`
-                    : `Geschätzt ca. 3-5 Minuten mit ${model || 'qwen2.5:14b'}`
-                  }
+                  {numChanges} Änderungen{isClaude ? ` in ${numBatches} Batches` : ''} | Geschätzt ca. {estMins} {estMins === 1 ? 'Minute' : 'Minuten'} ({isClaude ? CLAUDE_MODEL_NAMES[model] || model : model || 'qwen2.5:14b'})
                 </p>
               </div>
             );
