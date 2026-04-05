@@ -3604,84 +3604,222 @@ def ai_analyze(doc_id, version_a, version_b):
 
 @api.route('/ai/export-docx', methods=['POST'])
 def ai_export_docx():
-    """Export AI analysis result as a formatted Word document."""
+    """Export AI analysis as a professional Word document with tables."""
     import tempfile
-    import re
     from docx import Document as DocxDocument
-    from docx.shared import Pt, RGBColor, Inches
+    from docx.shared import Pt, RGBColor, Inches, Cm, Emu
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml.ns import qn
     from datetime import datetime
 
     data = request.get_json() or {}
-    analysis = data.get('analysis', '')
+    issue_list = data.get('issue_list')
     client_party = data.get('client_party', 'Mandant')
     model_name = data.get('model', '')
     change_count = data.get('change_count', 0)
 
+    # Fallback for unstructured
+    if not issue_list:
+        raw = data.get('analysis', data.get('raw', ''))
+        issue_list = {'title': 'AI Issue List', 'sections': [],
+                      'subtitle': f'Mandant: {client_party}',
+                      'executive_summary': {'strategy': raw}}
+
     doc = DocxDocument()
 
-    # Title
-    title = doc.add_heading('AI Issue List', level=0)
+    SEVERITY_COLORS = {
+        'KRITISCH': RGBColor(220, 38, 38),
+        'WICHTIG': RGBColor(234, 88, 12),
+        'NEUTRAL': RGBColor(100, 100, 100),
+        'VORTEILHAFT': RGBColor(22, 163, 74),
+    }
+    SEVERITY_BG = {
+        'KRITISCH': 'FFCCCC',
+        'WICHTIG': 'FFE4CC',
+        'NEUTRAL': 'F5F5F5',
+        'VORTEILHAFT': 'CCFFCC',
+    }
+    HEADER_BG = '1F3864'
+    HEADER_TEXT = RGBColor(255, 255, 255)
+
+    def set_cell_bg(cell, color_hex):
+        shading = cell._element.get_or_add_tcPr()
+        shd = shading.makeelement(qn('w:shd'), {
+            qn('w:fill'): color_hex, qn('w:val'): 'clear'})
+        shading.append(shd)
+
+    def add_cell_text(cell, text, bold=False, size=8, color=None):
+        p = cell.paragraphs[0]
+        p.paragraph_format.space_before = Pt(2)
+        p.paragraph_format.space_after = Pt(2)
+        run = p.add_run(str(text) if text else '')
+        run.font.size = Pt(size)
+        run.font.name = 'Calibri'
+        if bold:
+            run.bold = True
+        if color:
+            run.font.color.rgb = color
+
+    # ── Title ──
+    title = doc.add_heading(issue_list.get('title', 'ISSUE LIST'), level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in title.runs:
+        run.font.color.rgb = RGBColor(31, 56, 100)
 
-    # Metadata
-    meta = doc.add_paragraph()
-    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    meta_run = meta.add_run(
-        f'Mandant: {client_party} | Modell: {model_name} | '
-        f'{change_count} Änderungen analysiert\n'
-        f'Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M")}'
-    )
-    meta_run.font.size = Pt(9)
-    meta_run.font.color.rgb = RGBColor(128, 128, 128)
+    # Subtitle
+    sub = doc.add_paragraph()
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = sub.add_run(f'{issue_list.get("subtitle", "")} | {model_name} | '
+                    f'Erstellt: {datetime.now().strftime("%d.%m.%Y %H:%M")}')
+    r.font.size = Pt(9)
+    r.font.color.rgb = RGBColor(128, 128, 128)
 
-    doc.add_paragraph()  # spacer
+    # Confidential marker
+    conf = doc.add_paragraph()
+    conf.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = conf.add_run('VERTRAULICH | NUR FÜR INTERNE ZWECKE')
+    r.font.size = Pt(8)
+    r.font.color.rgb = RGBColor(180, 0, 0)
+    r.bold = True
 
-    # Parse analysis text into formatted paragraphs
-    for line in analysis.split('\n'):
-        stripped = line.strip()
-        if not stripped:
-            doc.add_paragraph()
+    # ── Executive Summary ──
+    summary = issue_list.get('executive_summary', {})
+    if summary:
+        doc.add_heading('EXECUTIVE SUMMARY', level=1)
+        if summary.get('strategy'):
+            p = doc.add_paragraph()
+            p.add_run(summary['strategy']).font.size = Pt(10)
+
+        # Summary stats table
+        stats = []
+        for key, label, color in [
+            ('critical', 'Kritisch', 'FFCCCC'),
+            ('important', 'Wichtig', 'FFE4CC'),
+            ('neutral', 'Neutral', 'F5F5F5'),
+            ('favorable', 'Vorteilhaft', 'CCFFCC'),
+        ]:
+            val = summary.get(key, 0)
+            if val:
+                stats.append((label, val, color))
+
+        if stats:
+            tbl = doc.add_table(rows=1, cols=len(stats))
+            tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+            for i, (label, val, bg) in enumerate(stats):
+                cell = tbl.cell(0, i)
+                set_cell_bg(cell, bg)
+                p = cell.paragraphs[0]
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                r = p.add_run(f'{label}: {val}')
+                r.font.size = Pt(9)
+                r.bold = True
+
+        if summary.get('key_risks'):
+            doc.add_heading('Kritische Punkte', level=2)
+            for risk in summary['key_risks']:
+                p = doc.add_paragraph(style='List Bullet')
+                r = p.add_run(risk)
+                r.font.size = Pt(10)
+
+    # ── Sections with Issue Tables ──
+    for section in issue_list.get('sections', []):
+        sec_num = section.get('number', '')
+        sec_title = section.get('title', '')
+        doc.add_heading(f'{sec_num}. {sec_title}', level=1)
+
+        if section.get('summary'):
+            p = doc.add_paragraph()
+            r = p.add_run(section['summary'])
+            r.font.size = Pt(9)
+            r.font.italic = True
+            r.font.color.rgb = RGBColor(80, 80, 80)
+
+        issues = section.get('issues', [])
+        if not issues:
             continue
 
-        # Headings
-        if stripped.startswith('### '):
-            doc.add_heading(stripped[4:], level=3)
-        elif stripped.startswith('## '):
-            doc.add_heading(stripped[3:], level=2)
-        elif stripped.startswith('# '):
-            doc.add_heading(stripped[2:], level=1)
-        else:
-            p = doc.add_paragraph()
-            # Parse bold (**text**) inline
-            parts = re.split(r'(\*\*.*?\*\*)', stripped)
-            for part in parts:
-                if part.startswith('**') and part.endswith('**'):
-                    run = p.add_run(part[2:-2])
-                    run.bold = True
-                    upper = part[2:-2].upper()
-                    if 'KRITISCH' in upper:
-                        run.font.color.rgb = RGBColor(220, 38, 38)
-                    elif 'WICHTIG' in upper:
-                        run.font.color.rgb = RGBColor(234, 88, 12)
-                    elif 'VORTEILHAFT' in upper:
-                        run.font.color.rgb = RGBColor(22, 163, 74)
-                else:
-                    p.add_run(part)
+        # Create table: Ref | Issue/Change | Version A | Version B | Kommentar
+        cols = 5
+        tbl = doc.add_table(rows=1 + len(issues), cols=cols)
+        tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
 
-            # Indent bullet points
-            if stripped.startswith('- ') or stripped.startswith('* '):
-                p.paragraph_format.left_indent = Inches(0.3)
+        # Header row
+        headers = ['Ref.', 'Issue / Change', 'Version A\n(Alt)', 'Version B\n(Neu)', 'Kommentar']
+        for i, h in enumerate(headers):
+            cell = tbl.cell(0, i)
+            set_cell_bg(cell, HEADER_BG)
+            add_cell_text(cell, h, bold=True, size=8, color=HEADER_TEXT)
 
-    # Footer
+        # Data rows
+        for row_idx, issue in enumerate(issues, 1):
+            severity = issue.get('severity', 'NEUTRAL').upper()
+            sev_bg = SEVERITY_BG.get(severity, 'F5F5F5')
+            sev_color = SEVERITY_COLORS.get(severity, RGBColor(100, 100, 100))
+
+            # Ref cell with severity background
+            ref_cell = tbl.cell(row_idx, 0)
+            set_cell_bg(ref_cell, sev_bg)
+            p = ref_cell.paragraphs[0]
+            r = p.add_run(issue.get('ref', ''))
+            r.font.size = Pt(8)
+            r.bold = True
+            p.add_run('\n')
+            label_txt = issue.get('label', '')
+            if label_txt:
+                r2 = p.add_run(label_txt)
+                r2.font.size = Pt(7)
+                r2.bold = True
+
+            # Issue cell
+            issue_cell = tbl.cell(row_idx, 1)
+            p = issue_cell.paragraphs[0]
+            # Severity badge
+            sev_run = p.add_run(f'[{severity}] ')
+            sev_run.font.size = Pt(7)
+            sev_run.bold = True
+            sev_run.font.color.rgb = sev_color
+            # Issue text
+            issue_run = p.add_run(issue.get('issue', ''))
+            issue_run.font.size = Pt(8)
+            # Recommendation
+            rec = issue.get('recommendation', '')
+            if rec:
+                p.add_run('\n')
+                rec_run = p.add_run(f'Empfehlung: {rec}')
+                rec_run.font.size = Pt(7)
+                rec_run.bold = True
+                rec_run.font.color.rgb = sev_color
+
+            # Old text
+            old_cell = tbl.cell(row_idx, 2)
+            add_cell_text(old_cell, issue.get('old_text', ''), size=7)
+
+            # New text
+            new_cell = tbl.cell(row_idx, 3)
+            add_cell_text(new_cell, issue.get('new_text', ''), size=7)
+
+            # Comment
+            comment_cell = tbl.cell(row_idx, 4)
+            add_cell_text(comment_cell, issue.get('comment', ''), size=7)
+
+        # Set column widths
+        for row in tbl.rows:
+            row.cells[0].width = Cm(2.0)
+            row.cells[1].width = Cm(6.0)
+            row.cells[2].width = Cm(3.5)
+            row.cells[3].width = Cm(3.5)
+            row.cells[4].width = Cm(3.5)
+
+        doc.add_paragraph()  # spacer
+
+    # ── Footer ──
     doc.add_paragraph()
     footer = doc.add_paragraph()
-    footer_run = footer.add_run(
-        'Erstellt mit MyCompare AI — Automatische Analyse, keine Rechtsberatung.'
-    )
-    footer_run.font.size = Pt(8)
-    footer_run.font.color.rgb = RGBColor(160, 160, 160)
-    footer_run.font.italic = True
+    r = footer.add_run('Erstellt mit MyCompare AI — Automatische Analyse, keine Rechtsberatung.')
+    r.font.size = Pt(8)
+    r.font.color.rgb = RGBColor(160, 160, 160)
+    r.italic = True
 
     tmpfile = tempfile.NamedTemporaryFile(suffix='.docx', delete=False)
     doc.save(tmpfile.name)
