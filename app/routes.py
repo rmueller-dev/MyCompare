@@ -3423,3 +3423,97 @@ def ai_analyze(doc_id, version_a, version_b):
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
+
+
+@api.route('/ai/export-docx', methods=['POST'])
+def ai_export_docx():
+    """Export AI analysis result as a formatted Word document."""
+    import tempfile
+    import re
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from datetime import datetime
+
+    data = request.get_json() or {}
+    analysis = data.get('analysis', '')
+    client_party = data.get('client_party', 'Mandant')
+    model_name = data.get('model', '')
+    change_count = data.get('change_count', 0)
+
+    doc = DocxDocument()
+
+    # Title
+    title = doc.add_heading('AI Issue List', level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Metadata
+    meta = doc.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta_run = meta.add_run(
+        f'Mandant: {client_party} | Modell: {model_name} | '
+        f'{change_count} Änderungen analysiert\n'
+        f'Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M")}'
+    )
+    meta_run.font.size = Pt(9)
+    meta_run.font.color.rgb = RGBColor(128, 128, 128)
+
+    doc.add_paragraph()  # spacer
+
+    # Parse analysis text into formatted paragraphs
+    for line in analysis.split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            doc.add_paragraph()
+            continue
+
+        # Headings
+        if stripped.startswith('### '):
+            doc.add_heading(stripped[4:], level=3)
+        elif stripped.startswith('## '):
+            doc.add_heading(stripped[3:], level=2)
+        elif stripped.startswith('# '):
+            doc.add_heading(stripped[2:], level=1)
+        else:
+            p = doc.add_paragraph()
+            # Parse bold (**text**) inline
+            parts = re.split(r'(\*\*.*?\*\*)', stripped)
+            for part in parts:
+                if part.startswith('**') and part.endswith('**'):
+                    run = p.add_run(part[2:-2])
+                    run.bold = True
+                    upper = part[2:-2].upper()
+                    if 'KRITISCH' in upper:
+                        run.font.color.rgb = RGBColor(220, 38, 38)
+                    elif 'WICHTIG' in upper:
+                        run.font.color.rgb = RGBColor(234, 88, 12)
+                    elif 'VORTEILHAFT' in upper:
+                        run.font.color.rgb = RGBColor(22, 163, 74)
+                else:
+                    p.add_run(part)
+
+            # Indent bullet points
+            if stripped.startswith('- ') or stripped.startswith('* '):
+                p.paragraph_format.left_indent = Inches(0.3)
+
+    # Footer
+    doc.add_paragraph()
+    footer = doc.add_paragraph()
+    footer_run = footer.add_run(
+        'Erstellt mit MyCompare AI — Automatische Analyse, keine Rechtsberatung.'
+    )
+    footer_run.font.size = Pt(8)
+    footer_run.font.color.rgb = RGBColor(160, 160, 160)
+    footer_run.font.italic = True
+
+    tmpfile = tempfile.NamedTemporaryFile(suffix='.docx', delete=False)
+    doc.save(tmpfile.name)
+    tmpfile.close()
+
+    return send_from_directory(
+        os.path.dirname(tmpfile.name),
+        os.path.basename(tmpfile.name),
+        as_attachment=True,
+        download_name=f'IssueList_{client_party}.docx',
+        mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    )
