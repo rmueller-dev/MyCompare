@@ -313,7 +313,7 @@ export default function AiAnalysis({ docId, docName, versionA, versionB, onClose
                         )}
                       </div>
                       <p className="text-[10px] text-violet-500 mt-1">
-                        Key von console.anthropic.com — wird nur im Arbeitsspeicher gespeichert
+                        Key von console.anthropic.com — wird lokal gespeichert
                       </p>
                     </div>
                   )}

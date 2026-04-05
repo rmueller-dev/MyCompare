@@ -19,17 +19,37 @@ CLAUDE_MODELS = {
     "claude-opus-4-20250514": "Claude Opus 4",
 }
 
-# API key can be set via environment variable or passed per request
-_api_key_store = {"key": os.environ.get("ANTHROPIC_API_KEY", "")}
+# Persistent config file for API key (stored next to the database)
+_BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+_CONFIG_PATH = os.path.join(_BASE_DIR, '..', '.api_config.json')
+
+
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_PATH, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_config(cfg: dict):
+    with open(_CONFIG_PATH, 'w') as f:
+        json.dump(cfg, f, indent=2)
 
 
 def set_api_key(key: str):
-    """Store the Anthropic API key in memory."""
-    _api_key_store["key"] = key.strip()
+    """Store the Anthropic API key persistently."""
+    cfg = _load_config()
+    cfg["anthropic_api_key"] = key.strip()
+    _save_config(cfg)
 
 
 def get_api_key() -> str:
-    return _api_key_store["key"] or os.environ.get("ANTHROPIC_API_KEY", "")
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if env_key:
+        return env_key
+    cfg = _load_config()
+    return cfg.get("anthropic_api_key", "")
 
 
 def _check_ollama():

@@ -6,4 +6,5 @@ storage/
 frontend/node_modules/
 frontend/build/
 .env
+.api_config.json
 .claude/
