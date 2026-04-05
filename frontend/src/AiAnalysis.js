@@ -405,7 +405,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
             let estimatedSeconds;
             if (isClaude) {
               const numBatches = Math.ceil(numChanges / 50);
-              estimatedSeconds = numBatches * 18 + 10; // 18s per batch (15s + 3s pause) + 10s overhead
+              estimatedSeconds = numBatches * 18 + 25; // 18s per batch (15s + 3s pause) + 25s for filter pass
             } else {
               estimatedSeconds = Math.max(120, numChanges * 2);
             }
@@ -427,6 +427,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
             if (isClaude) {
               if (pct < 3) phase = `${numChanges} Änderungen werden in ${numBatches} Batches aufgeteilt...`;
               else if (pct < 90) phase = `Batch ${currentBatch} von ${numBatches} wird analysiert...`;
+              else if (pct < 95) phase = 'Relevanzfilter: nur wirtschaftlich/rechtlich relevante Issues...';
               else phase = 'Issue List wird zusammengeführt...';
             } else {
               if (pct < 5) phase = 'Änderungen werden aufbereitet...';
@@ -478,6 +479,9 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
                   </span>
                   {' '}| {result.change_count} Änderungen{result.batches > 1 ? ` (${result.batches} Batches)` : ''}
                 </p>
+                {issueList.filter_note && (
+                  <p className="text-xs text-green-300 mt-0.5">{issueList.filter_note}</p>
+                )}
               </div>
 
               {/* Summary stats */}

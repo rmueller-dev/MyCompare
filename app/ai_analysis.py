@@ -392,6 +392,142 @@ def _roman(n: int) -> str:
     return result
 
 
+def _filter_relevant_issues(issue_list: Dict, api_key: str, model: str,
+                            client_party: str) -> Dict:
+    """Second pass: filter issues to keep only legally/economically relevant ones.
+    Removes purely editorial, formatting, and cosmetic changes."""
+    sections = issue_list.get("sections", [])
+    if not sections:
+        return None
+
+    # Build a compact list of all issues for the filter prompt
+    all_issues = []
+    for section in sections:
+        for issue in section.get("issues", []):
+            all_issues.append({
+                "ref": issue.get("ref", ""),
+                "label": issue.get("label", ""),
+                "issue": issue.get("issue", ""),
+                "severity": issue.get("severity", ""),
+                "section": section.get("title", ""),
+            })
+
+    if len(all_issues) <= 10:
+        # Few enough issues, no filtering needed
+        return None
+
+    issues_json = json.dumps(all_issues, ensure_ascii=False)
+
+    filter_prompt = f"""Du bist ein erfahrener M&A-Anwalt. Ich gebe dir eine Liste von Issues aus einem Vertragsvergleich.
+
+Filtere die Liste: Behalte NUR Issues mit WIRTSCHAFTLICHER oder RECHTLICHER Relevanz.
+
+ENTFERNEN:
+- Rein redaktionelle/sprachliche Änderungen ohne inhaltliche Auswirkung
+- Formatierungsänderungen, Nummerierungsänderungen
+- Tippfehler-Korrekturen
+- Reine Klarstellungen die nichts an der Rechtslage ändern
+- Umformulierungen die denselben Inhalt haben
+
+BEHALTEN:
+- Änderungen an Rechten, Pflichten, Haftung, Gewährleistungen
+- Kaufpreis, Zahlungsbedingungen, wirtschaftliche Konditionen
+- Fristen, Termine, Bedingungen
+- Definitionen die den Anwendungsbereich ändern
+- Risikoverteilung, Garantien, Freistellungen
+- Wettbewerbsverbote, Geheimhaltung
+- Closing-Bedingungen, MAC-Klauseln
+- Alles was die Position von {client_party} beeinflusst
+
+ISSUES:
+{issues_json}
+
+Antworte NUR mit einem JSON-Array der Ref-Nummern die BEHALTEN werden sollen:
+["1.1", "1.3", "2.1", ...]
+
+NUR das JSON-Array, nichts anderes."""
+
+    import time
+    time.sleep(3)
+
+    result = _call_claude_api(api_key, model, filter_prompt, max_tokens=4096)
+    if "error" in result:
+        return None
+
+    raw = result.get("raw_text", "")
+
+    # Parse the ref list
+    try:
+        # Try direct parse
+        keep_refs = set(json.loads(raw.strip()))
+    except json.JSONDecodeError:
+        # Try to extract array
+        match = re.search(r'\[.*?\]', raw, re.DOTALL)
+        if match:
+            try:
+                keep_refs = set(json.loads(match.group(0)))
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+
+    if not keep_refs:
+        return None
+
+    # Filter sections: keep only issues in keep_refs
+    filtered_sections = []
+    total_critical = 0
+    total_important = 0
+    total_neutral = 0
+    total_favorable = 0
+    section_num = 0
+
+    for section in sections:
+        kept_issues = [i for i in section.get("issues", [])
+                       if i.get("ref", "") in keep_refs]
+        if not kept_issues:
+            continue
+
+        section_num += 1
+        section_copy = dict(section)
+        section_copy["number"] = _roman(section_num)
+        section_copy["issues"] = kept_issues
+        filtered_sections.append(section_copy)
+
+        for issue in kept_issues:
+            sev = issue.get("severity", "").upper()
+            if sev == "KRITISCH":
+                total_critical += 1
+            elif sev == "WICHTIG":
+                total_important += 1
+            elif sev == "VORTEILHAFT":
+                total_favorable += 1
+            else:
+                total_neutral += 1
+
+    total_issues = total_critical + total_important + total_neutral + total_favorable
+    original_count = sum(len(s.get("issues", [])) for s in sections)
+
+    # Preserve original summary but update counts
+    orig_summary = issue_list.get("executive_summary", {})
+
+    return {
+        "title": issue_list.get("title", ""),
+        "subtitle": issue_list.get("subtitle", ""),
+        "filter_note": f"Gefiltert: {total_issues} von {original_count} Issues mit wirtschaftlicher/rechtlicher Relevanz",
+        "sections": filtered_sections,
+        "executive_summary": {
+            "total_issues": total_issues,
+            "critical": total_critical,
+            "important": total_important,
+            "neutral": total_neutral,
+            "favorable": total_favorable,
+            "key_risks": orig_summary.get("key_risks", []),
+            "strategy": orig_summary.get("strategy", ""),
+        },
+    }
+
+
 def analyze_changes_claude(
     changes: List[Dict],
     client_party: str,
@@ -476,6 +612,11 @@ def analyze_changes_claude(
 
     # Merge all batch results into one comprehensive issue list
     merged = _merge_batch_results(batch_results, document_context, client_party)
+
+    # ── FILTER PASS: Keep only legally/economically relevant issues ──
+    filtered = _filter_relevant_issues(merged, api_key, use_model, client_party)
+    if filtered:
+        merged = filtered
 
     return {
         "status": "ok",
