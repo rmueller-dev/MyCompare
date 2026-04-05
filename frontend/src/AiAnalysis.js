@@ -85,11 +85,11 @@ const CLAUDE_MODEL_NAMES = {
   'claude-opus-4-20250514': 'Claude Opus 4 (~30 Cent)',
 };
 
-export default function AiAnalysis({ docId, versionA, versionB, onClose }) {
+export default function AiAnalysis({ docId, docName, versionA, versionB, onClose }) {
   const [step, setStep] = useState('form');
   const [clientParty, setClientParty] = useState('');
   const [clientVersion, setClientVersion] = useState('a');
-  const [documentContext, setDocumentContext] = useState('');
+  const [documentContext, setDocumentContext] = useState(docName || '');
   const [provider, setProvider] = useState('ollama');
   const [model, setModel] = useState('');
   const [ollamaModels, setOllamaModels] = useState([]);
