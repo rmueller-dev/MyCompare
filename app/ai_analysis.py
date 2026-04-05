@@ -110,7 +110,9 @@ Antworte NUR mit validem JSON in exakt diesem Format:
 
 Regeln:
 - severity: Nur "KRITISCH", "WICHTIG", "NEUTRAL" oder "VORTEILHAFT"
-- Gruppiere verwandte Änderungen in Abschnitte
+- Fasse verwandte Änderungen zu EINEM Issue zusammen (z.B. mehrere Definitionsänderungen = 1 Issue)
+- Maximal 3-5 Abschnitte, maximal 3-5 Issues pro Abschnitt
+- Halte old_text und new_text KURZ (max 80 Zeichen)
 - Bewerte aus Sicht von {client_party}
 - Sei präzise und praxisorientiert
 - Antworte auf Deutsch
@@ -179,6 +181,9 @@ def analyze_changes(
     prompt = _build_prompt(changes, client_party, document_context,
                            client_version=client_version)
 
+    # Scale num_predict based on number of changes
+    num_predict = 4096 if len(changes) <= 20 else 6144
+
     try:
         response = requests.post(
             OLLAMA_URL,
@@ -188,7 +193,8 @@ def analyze_changes(
                 "stream": False,
                 "options": {
                     "temperature": 0.2,
-                    "num_predict": 8192,
+                    "num_predict": num_predict,
+                    "num_ctx": 16384,
                 },
             },
             timeout=3600,

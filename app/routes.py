@@ -3762,9 +3762,36 @@ def ai_analyze(doc_id, version_a, version_b):
                 'change_count': 0,
             })
 
-        # Limit to 100 changes to keep prompt manageable
-        truncated = len(changes) > 100
-        analysis_changes = changes[:100]
+        # Filter out trivial changes (whitespace-only, very short)
+        significant_changes = []
+        for ch in changes:
+            old = (ch.get('old') or '').strip()
+            new = (ch.get('new') or '').strip()
+            # Skip whitespace-only or very short trivial changes
+            if not old and not new:
+                continue
+            combined = old + new
+            if len(combined) < 3:
+                continue
+            # Truncate text more aggressively for LLM prompt
+            ch_copy = dict(ch)
+            ch_copy['old'] = old[:200]
+            ch_copy['new'] = new[:200]
+            significant_changes.append(ch_copy)
+
+        # Limit to 50 most significant changes to keep prompt manageable
+        # Prefer longer/more substantial changes over short ones
+        if len(significant_changes) > 50:
+            significant_changes.sort(
+                key=lambda c: len(c.get('old', '')) + len(c.get('new', '')),
+                reverse=True)
+            analysis_changes = significant_changes[:50]
+            # Re-sort by paragraph number for logical order
+            analysis_changes.sort(key=lambda c: c.get('para', 0))
+            truncated = True
+        else:
+            analysis_changes = significant_changes
+            truncated = len(changes) > len(significant_changes)
 
         result = analyze_changes(
             analysis_changes,
