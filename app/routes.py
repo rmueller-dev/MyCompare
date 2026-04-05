@@ -3791,26 +3791,27 @@ def ai_analyze(doc_id, version_a, version_b):
         for ch in changes:
             old = (ch.get('old') or '').strip()
             new = (ch.get('new') or '').strip()
-            # Skip whitespace-only or very short trivial changes
             if not old and not new:
                 continue
             combined = old + new
             if len(combined) < 3:
                 continue
-            # Truncate text more aggressively for LLM prompt
             ch_copy = dict(ch)
-            ch_copy['old'] = old[:200]
-            ch_copy['new'] = new[:200]
+            ch_copy['old'] = old[:300]
+            ch_copy['new'] = new[:300]
             significant_changes.append(ch_copy)
 
-        # Limit to 50 most significant changes to keep prompt manageable
-        # Prefer longer/more substantial changes over short ones
-        if len(significant_changes) > 50:
+        # Claude API can handle much more context than local Ollama
+        if provider == 'claude':
+            max_changes = 500
+        else:
+            max_changes = 50
+
+        if len(significant_changes) > max_changes:
             significant_changes.sort(
                 key=lambda c: len(c.get('old', '')) + len(c.get('new', '')),
                 reverse=True)
-            analysis_changes = significant_changes[:50]
-            # Re-sort by paragraph number for logical order
+            analysis_changes = significant_changes[:max_changes]
             analysis_changes.sort(key=lambda c: c.get('para', 0))
             truncated = True
         else:

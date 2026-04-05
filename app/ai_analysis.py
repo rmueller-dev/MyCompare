@@ -96,7 +96,8 @@ def get_providers_status():
 
 
 def _build_prompt(changes: List[Dict], client_party: str,
-                  document_context: str = "", client_version: str = "a") -> str:
+                  document_context: str = "", client_version: str = "a",
+                  provider: str = "ollama") -> str:
     """Build the analysis prompt for structured JSON output."""
     changes_text = []
     for i, ch in enumerate(changes, 1):
@@ -177,9 +178,9 @@ Antworte NUR mit validem JSON in exakt diesem Format:
 
 Regeln:
 - severity: Nur "KRITISCH", "WICHTIG", "NEUTRAL" oder "VORTEILHAFT"
-- Fasse verwandte Änderungen zu EINEM Issue zusammen (z.B. mehrere Definitionsänderungen = 1 Issue)
-- Maximal 3-5 Abschnitte, maximal 3-5 Issues pro Abschnitt
-- Halte old_text und new_text KURZ (max 80 Zeichen)
+{f"- Erstelle einen VOLLSTÄNDIGEN Überblick über ALLE Änderungen — JEDE Änderung muss in einem Issue erfasst sein" if provider == "claude" else "- Fasse verwandte Änderungen zu EINEM Issue zusammen"}
+{f"- Erstelle so viele Abschnitte und Issues wie nötig, um alle Änderungen abzudecken" if provider == "claude" else "- Maximal 3-5 Abschnitte, maximal 3-5 Issues pro Abschnitt"}
+{f"- Nur wirklich eng verwandte Änderungen (z.B. gleiche Klausel) zu einem Issue zusammenfassen" if provider == "claude" else "- Halte old_text und new_text KURZ (max 80 Zeichen)"}
 - Bewerte aus Sicht von {client_party}
 - Sei präzise und praxisorientiert
 - Antworte auf Deutsch
@@ -263,7 +264,10 @@ def analyze_changes_claude(
     use_model = model or CLAUDE_DEFAULT_MODEL
 
     prompt = _build_prompt(changes, client_party, document_context,
-                           client_version=client_version)
+                           client_version=client_version, provider="claude")
+
+    # Scale max_tokens based on number of changes
+    max_tokens = min(16384, max(8192, len(changes) * 120))
 
     try:
         response = requests.post(
@@ -275,7 +279,7 @@ def analyze_changes_claude(
             },
             json={
                 "model": use_model,
-                "max_tokens": 8192,
+                "max_tokens": max_tokens,
                 "temperature": 0.2,
                 "messages": [
                     {"role": "user", "content": prompt}
@@ -361,7 +365,7 @@ def analyze_changes(
             }
 
     prompt = _build_prompt(changes, client_party, document_context,
-                           client_version=client_version)
+                           client_version=client_version, provider="ollama")
 
     num_predict = 4096 if len(changes) <= 20 else 6144
 
