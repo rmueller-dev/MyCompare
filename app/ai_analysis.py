@@ -178,9 +178,9 @@ Antworte NUR mit validem JSON in exakt diesem Format:
 
 Regeln:
 - severity: Nur "KRITISCH", "WICHTIG", "NEUTRAL" oder "VORTEILHAFT"
-{f"- Erstelle einen VOLLSTÄNDIGEN Überblick über ALLE Änderungen — JEDE Änderung muss in einem Issue erfasst sein" if provider == "claude" else "- Fasse verwandte Änderungen zu EINEM Issue zusammen"}
-{f"- Erstelle so viele Abschnitte und Issues wie nötig, um alle Änderungen abzudecken" if provider == "claude" else "- Maximal 3-5 Abschnitte, maximal 3-5 Issues pro Abschnitt"}
-{f"- Nur wirklich eng verwandte Änderungen (z.B. gleiche Klausel) zu einem Issue zusammenfassen" if provider == "claude" else "- Halte old_text und new_text KURZ (max 80 Zeichen)"}
+- Erstelle einen VOLLSTÄNDIGEN Überblick über ALLE Änderungen — JEDE Änderung muss in einem Issue erfasst sein
+- Erstelle so viele Abschnitte und Issues wie nötig, um alle Änderungen abzudecken
+- Nur wirklich eng verwandte Änderungen (z.B. gleiche Klausel, gleicher Absatz) zu einem Issue zusammenfassen
 - Bewerte aus Sicht von {client_party}
 - Sei präzise und praxisorientiert
 - Antworte auf Deutsch
@@ -367,7 +367,7 @@ def analyze_changes(
     prompt = _build_prompt(changes, client_party, document_context,
                            client_version=client_version, provider="ollama")
 
-    num_predict = 4096 if len(changes) <= 20 else 6144
+    num_predict = min(16384, max(4096, len(changes) * 80))
 
     try:
         response = requests.post(

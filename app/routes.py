@@ -3801,11 +3801,11 @@ def ai_analyze(doc_id, version_a, version_b):
             ch_copy['new'] = new[:300]
             significant_changes.append(ch_copy)
 
-        # Claude API can handle much more context than local Ollama
+        # Send as many changes as possible for comprehensive analysis
         if provider == 'claude':
             max_changes = 500
         else:
-            max_changes = 50
+            max_changes = 200
 
         if len(significant_changes) > max_changes:
             significant_changes.sort(
