@@ -777,7 +777,7 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
         return etree.fromstring(etree.tostring(run_element))
 
     # Revision ID generator
-    rev_id_gen = iter(range(100, 200000))
+    rev_id_gen = iter(range(500000, 900000))
 
     def wrap_in_ins(run_el):
         """Wrap a run element in w:ins (insertion revision)."""
@@ -803,7 +803,7 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
         dele.append(run_el)
         return dele
 
-    bookmark_id_gen = iter(range(1000, 200000))
+    bookmark_id_gen = iter(range(900000, 999999))
 
     def add_bookmark(p_el, change_num):
         """Add a w:bookmarkStart / w:bookmarkEnd pair to mark a change for cross-referencing."""
@@ -937,10 +937,16 @@ def _generate_docx_redline(filepath_a, filepath_b, tmpdir):
     out_doc = DocxDocument(work_path)
 
     body = out_doc.element.body
-    # Remove all paragraphs and tables from body
+    # Remove all paragraphs and tables from body, but keep sectPr and other structural elements
     for child in list(body):
         tag_local = etree.QName(child.tag).localname if '}' in child.tag else child.tag
         if tag_local in ('p', 'tbl'):
+            # Don't remove the last paragraph if it contains sectPr
+            sect_pr = child.find(f'{{{W}}}pPr/{{{W}}}sectPr')
+            if sect_pr is None:
+                sect_pr = child.find(f'{{{W}}}sectPr')
+            if sect_pr is not None:
+                continue  # Keep paragraph with section properties
             body.remove(child)
 
     sm = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
@@ -1317,8 +1323,32 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
 
     doc_a = DocxDocument(filepath_a)
     doc_b = DocxDocument(filepath_b)
-    paras_a = [p.text or '' for p in doc_a.paragraphs]
-    paras_b = [p.text or '' for p in doc_b.paragraphs]
+
+    # Extract ALL text including tables
+    def get_all_text_blocks(doc):
+        """Extract text from paragraphs AND table cells, preserving order."""
+        blocks = []
+        body = doc.element.body
+        W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        for child in body:
+            tag = etree.QName(child.tag).localname if '}' in child.tag else child.tag
+            if tag == 'p':
+                text = ''.join(t.text or '' for t in child.iter(f'{{{W}}}t'))
+                blocks.append(text)
+            elif tag == 'tbl':
+                for row in child.iter(f'{{{W}}}tr'):
+                    row_texts = []
+                    for cell in row.iter(f'{{{W}}}tc'):
+                        cell_text = ''.join(t.text or '' for t in cell.iter(f'{{{W}}}t'))
+                        row_texts.append(cell_text.strip())
+                    combined = ' | '.join(t for t in row_texts if t)
+                    if combined:
+                        blocks.append(f'[Tabelle] {combined}')
+        return blocks
+
+    from lxml import etree
+    paras_a = get_all_text_blocks(doc_a)
+    paras_b = get_all_text_blocks(doc_b)
 
     # ── Move detection ──
     sm_pre = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
@@ -1612,7 +1642,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
                 r.font.color.rgb = CLR_WHITE
                 r.font.size = Pt(9)
 
-    for change in all_changes[:300]:
+    for change in all_changes:
         row = changes_table.add_row().cells
         # Nr.
         row[0].text = str(change['num'])
@@ -1658,17 +1688,7 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
         for cell in row:
             set_cell_bg(cell, bg)
 
-    if total_changes > 300:
-        row = changes_table.add_row().cells
-        row[0].text = ''
-        row[1].text = ''
-        row[2].merge(row[3])
-        row[2].text = f'... und {total_changes - 300} weitere Änderungen'
-        for p in row[2].paragraphs:
-            for r in p.runs:
-                r.font.size = Pt(8)
-                r.font.italic = True
-                r.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+    # No more truncation - all changes are included
 
     # Set column widths
     for row in changes_table.rows:
@@ -1676,6 +1696,82 @@ def _generate_docx_report(filepath_a, filepath_b, tmpdir):
         row.cells[1].width = Cm(2.5)
         row.cells[2].width = Cm(7)
         row.cells[3].width = Cm(7)
+
+    # ─── Vollständigkeitsprüfung ───
+    report.add_page_break()
+    p_h = report.add_paragraph()
+    run = p_h.add_run('Vollständigkeitsprüfung')
+    run.font.size = Pt(14)
+    run.font.bold = True
+    run.font.color.rgb = CLR_TITLE
+
+    # Count text blocks
+    total_blocks_a = len(paras_a)
+    total_blocks_b = len(paras_b)
+    table_changes = sum(1 for c in all_changes if c.get('old', '').startswith('[Tabelle]') or c.get('new', '').startswith('[Tabelle]'))
+    text_changes = total_changes - table_changes
+
+    # Compute coverage: how many blocks from A and B were matched by the diff
+    equal_blocks = sum(i2 - i1 for tag, i1, i2, j1, j2 in opcodes if tag == 'equal')
+    changed_blocks_a = sum(i2 - i1 for tag, i1, i2, j1, j2 in opcodes if tag in ('replace', 'delete'))
+    changed_blocks_b = sum(j2 - j1 for tag, i1, i2, j1, j2 in opcodes if tag in ('replace', 'insert'))
+    coverage_a = equal_blocks + changed_blocks_a
+    coverage_b = equal_blocks + changed_blocks_b
+
+    check_items = [
+        ('Textblöcke Version A (alt)', str(total_blocks_a), ''),
+        ('Textblöcke Version B (neu)', str(total_blocks_b), ''),
+        ('Erfasste Blöcke aus Version A', f'{coverage_a}/{total_blocks_a}',
+         'OK' if coverage_a == total_blocks_a else f'WARNUNG: {total_blocks_a - coverage_a} nicht erfasst'),
+        ('Erfasste Blöcke aus Version B', f'{coverage_b}/{total_blocks_b}',
+         'OK' if coverage_b == total_blocks_b else f'WARNUNG: {total_blocks_b - coverage_b} nicht erfasst'),
+        ('Erkannte Änderungen gesamt', str(total_changes), ''),
+        ('  davon Textänderungen', str(text_changes), ''),
+        ('  davon Tabellenänderungen', str(table_changes), ''),
+        ('Alle Änderungen im Bericht', f'{len(all_changes)}/{total_changes}',
+         'VOLLSTÄNDIG' if len(all_changes) == total_changes else f'UNVOLLSTÄNDIG'),
+    ]
+
+    verify_table = report.add_table(rows=1, cols=3)
+    verify_table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    hdr = verify_table.rows[0].cells
+    hdr[0].text = 'Prüfpunkt'
+    hdr[1].text = 'Wert'
+    hdr[2].text = 'Status'
+    for cell in hdr:
+        set_cell_bg(cell, '1565C0')
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.bold = True
+                r.font.color.rgb = CLR_WHITE
+                r.font.size = Pt(9)
+
+    for label, value, status in check_items:
+        row = verify_table.add_row().cells
+        row[0].text = label
+        row[1].text = value
+        row[2].text = status
+        for p in row[0].paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(9)
+        for p in row[1].paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(9)
+                r.font.bold = True
+        for p in row[2].paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(9)
+                if 'OK' in status or 'VOLLSTÄNDIG' == status:
+                    r.font.color.rgb = RGBColor(0x22, 0xA3, 0x4A)
+                    r.font.bold = True
+                elif 'WARNUNG' in status or 'UNVOLLSTÄNDIG' in status:
+                    r.font.color.rgb = CLR_DEL
+                    r.font.bold = True
+
+    for row in verify_table.rows:
+        row.cells[0].width = Cm(6)
+        row.cells[1].width = Cm(4)
+        row.cells[2].width = Cm(6)
 
     # ─── Bildvergleich (Image Changes) ───
     try:
