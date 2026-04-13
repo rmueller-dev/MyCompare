@@ -1,0 +1,72 @@
+{
+  "name": "mycompare",
+  "version": "1.0.0",
+  "description": "MyCompare — Dokumentenvergleich für Juristen",
+  "main": "main.js",
+  "author": "MyCompare",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac",
+    "dist:dmg": "electron-builder --mac dmg",
+    "dist:zip": "electron-builder --mac zip"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.0"
+  },
+  "build": {
+    "appId": "com.mycompare.app",
+    "productName": "MyCompare",
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "category": "public.app-category.business",
+      "icon": "icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["universal"]
+        }
+      ],
+      "hardenedRuntime": false
+    },
+    "extraResources": [
+      {
+        "from": "../app",
+        "to": "app",
+        "filter": ["**/*", "!__pycache__/**"]
+      },
+      {
+        "from": "../frontend/build",
+        "to": "frontend/build",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../requirements.txt",
+        "to": "requirements.txt"
+      },
+      {
+        "from": "../start.sh",
+        "to": "start.sh"
+      }
+    ],
+    "dmg": {
+      "title": "MyCompare",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
+  }
+}

@@ -8,3 +8,8 @@ frontend/build/
 .env
 .api_config.json
 .claude/
+electron/node_modules/
+electron/dist/
+electron/icon.iconset/
+electron/icon.icns
+electron/icon.png
