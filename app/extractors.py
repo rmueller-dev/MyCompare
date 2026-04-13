@@ -406,10 +406,28 @@ def extract_docx(filepath):
     """Extract text with formatting, fields, numbering, cross-refs, TOC, comments,
     footnotes, endnotes, XE/TA/TC index entries, and embedded images from DOCX files."""
     from docx import Document
+    from lxml import etree
     doc = Document(filepath)
 
-    # Accept all tracked changes so the comparison sees the final text
-    _accept_tracked_changes(doc.element)
+    # Accept all tracked changes in ALL parts of the document so the
+    # comparison sees the "clean" (all-changes-accepted) text.
+    # This mirrors Word/Litera "Accept All Changes" before compare.
+    _accept_tracked_changes(doc.element)  # main body
+
+    # Also accept tracked changes in headers, footers, footnotes, endnotes
+    for rel in doc.part.rels.values():
+        rt = rel.reltype
+        if any(k in rt for k in ('header', 'footer', 'footnotes', 'endnotes')):
+            try:
+                target_part = rel.target_part
+                if hasattr(target_part, '_element'):
+                    _accept_tracked_changes(target_part._element)
+                elif hasattr(target_part, 'blob'):
+                    root = etree.fromstring(target_part.blob)
+                    _accept_tracked_changes(root)
+                    target_part._blob = etree.tostring(root)
+            except Exception:
+                pass  # non-critical — skip if part can't be processed
 
     paragraphs = []
     plain_parts = []
