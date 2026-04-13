@@ -98,7 +98,7 @@ def get_providers_status():
 def _build_prompt(changes: List[Dict], client_party: str,
                   document_context: str = "", client_version: str = "a",
                   provider: str = "ollama") -> str:
-    """Build the analysis prompt for structured JSON output."""
+    """Build the analysis prompt for structured JSON output — universal contract format."""
     changes_text = []
     for i, ch in enumerate(changes, 1):
         ch_type = ch.get("type", "unbekannt")
@@ -121,46 +121,91 @@ def _build_prompt(changes: List[Dict], client_party: str,
 
     if client_version == "a":
         perspective = (
-            f"Version A (alt) ist das Dokument deines Mandanten ({client_party}). "
+            f"Version A (alt) ist das Dokument der beauftragenden Partei ({client_party}). "
             f"Version B (neu) enthält die Änderungen der Gegenseite."
         )
     else:
         perspective = (
-            f"Version B (neu) ist das Dokument deines Mandanten ({client_party}). "
+            f"Version B (neu) ist das Dokument der beauftragenden Partei ({client_party}). "
             f"Version A (alt) ist das Dokument der Gegenseite."
         )
 
     doc_ctx = f"\nDokumenttyp: {document_context}" if document_context else ""
 
-    prompt = f"""Du bist ein erfahrener deutscher Wirtschaftsanwalt und erstellst eine professionelle Issue List für eine Vertragsverhandlung.
+    prompt = f"""Du bist ein erfahrener Transaktions- und Vertragsanwalt und erstellst eine professionelle Issue List zu einem vorgelegten Vertragsdokument.
 
-Mandant: {client_party}
+Beauftragende Partei: {client_party}
 {perspective}{doc_ctx}
+
+## AUFGABE
+Analysiere die nachfolgenden Änderungen (Redline) und erstelle eine strukturierte, anwaltliche Issue List. Identifiziere alle rechtlich und kommerziell relevanten Punkte aus der Perspektive von {client_party}.
 
 ÄNDERUNGEN (Version A → Version B):
 {changes_block}
 
-Erstelle eine strukturierte Issue List als JSON. Gruppiere die Änderungen in thematische Abschnitte (z.B. "Definitionen", "Kaufpreis", "Garantien", "Haftung", etc.).
+## AUSWAHL UND PRIORISIERUNG DER ISSUES
 
-Antworte NUR mit validem JSON in exakt diesem Format:
+**KRITISCH (ROT) — immer aufnehmen:**
+- Haftungsregelungen, die das Risiko von {client_party} erheblich ausweiten (Gesamtschuld, unbegrenzte Haftung, fehlende Caps)
+- Neue oder verschärfte Freistellungspflichten (Indemnities)
+- Einseitige Kündigungsrechte der Gegenseite ohne sachlichen Grund
+- Vergütungskürzungen, Einbehalte, Escrow- oder Retention-Strukturen
+- Garantien oder Zusicherungen ohne Materiality Qualifier oder Knowledge Qualifier
+- Wettbewerbs- oder Exklusivitätsklauseln mit erheblicher wirtschaftlicher Reichweite
+- IP-Regelungen, die {client_party} Rechte entziehen
+- Change-of-Control-Klauseln mit Nachteil für {client_party}
+- Einseitige Jurisdiktionswahl oder unvorteilhaftes anwendbares Recht
+- Jede Klausel, die bei Verstoß erhebliche Vertragsstrafen oder Schadensersatzpflichten auslöst
+
+**BEDEUTEND (GELB) — aufnehmen wenn material:**
+- Definitionen mit erheblicher Ausstrahlungswirkung auf andere Klauseln
+- Geänderte Fristen (Verjährung, Anzeigepflichten, Lieferzeiten)
+- Erweiterte oder eingeschränkte Leistungspflichten
+- Neue Covenants oder Verhaltenspflichten während der Vertragslaufzeit
+- Geänderte Zahlungsbedingungen oder Fälligkeiten
+- Einschränkungen der Abtretbarkeit von Rechten
+- Klauseln, die Drittparteirechte begründen
+
+**REDAKTIONELL (WEISS) — nur wenn relevant:**
+- Klarstellungen ohne kommerzielle Auswirkung
+- Formale Umstrukturierungen ohne inhaltliche Änderung
+- Offensichtliche Druckfehler oder Querverweisfehler
+
+**Nicht aufnehmen:** Rein sprachliche Umformulierungen, Formatierung, Tippfehler, Nummerierungsänderungen ohne inhaltliche Änderung.
+
+## SEKTIONSSTRUKTUR
+Teile die Issues in logische Sektionen entsprechend der Struktur des Vertragsdokuments auf. Erstelle nur Sektionen für die es tatsächlich Issues gibt. Typische Sektionen (passe sie dem konkreten Dokument an):
+- Parteien & Definitionen
+- Leistungsumfang / Vertragsgegenstand
+- Vergütung & Zahlungsbedingungen
+- Laufzeit & Kündigung
+- Haftung & Freistellung
+- Gewährleistungen & Zusicherungen
+- Geheimhaltung & Datenschutz
+- IP / Lizenzrechte
+- Wettbewerbsverbote / Exklusivität
+- Change of Control / Abtretung
+- Streitbeilegung & anwendbares Recht
+- Allgemeine Bestimmungen
+
+## JSON-FORMAT
+Antworte NUR mit validem JSON:
 {{
   "title": "ISSUE LIST — {document_context or 'Vertrag'}",
-  "subtitle": "Mandant: {client_party}",
+  "subtitle": "Beauftragende Partei: {client_party}",
   "sections": [
     {{
       "number": "I",
-      "title": "ABSCHNITTSTITEL IN GROSSBUCHSTABEN",
-      "summary": "Kurze Zusammenfassung der Änderungen in diesem Abschnitt (1-2 Sätze)",
+      "title": "SEKTIONS-TITEL",
       "issues": [
         {{
           "ref": "1.1",
-          "label": "Kurzer Bezeichner (z.B. Definition 'Parteien')",
-          "issue": "Beschreibung der Änderung und ihrer Bedeutung. Was wurde geändert und warum ist das relevant?",
-          "old_text": "Originaltext aus Version A (kurz, max 100 Zeichen)",
-          "new_text": "Neuer Text aus Version B (kurz, max 100 Zeichen)",
+          "label": "Section/Klausel X.Y — Kurztitel",
           "severity": "KRITISCH",
-          "recommendation": "Ablehnen / Nachverhandeln / Akzeptieren / Gegenvorschlag",
-          "comment": "Konkreter Kommentar und Handlungsempfehlung für den Mandanten"
+          "issue": "Vollständige rechtliche Analyse: (1) Was wurde geändert oder ist problematisch, (2) konkrete Formulierung oder Regelung im Vertrag, (3) relevante Rechtsnorm, Marktstandard oder Vergleichsmaßstab.",
+          "party_a": "Ausgangslage / bisherige Fassung / Interesse von {client_party}",
+          "party_b": "Neue Forderung / aktuelle Vertragsfassung / Position der Gegenseite",
+          "comment": "Interne Anmerkung, Verhandlungsempfehlung, offene Fragen (TBC/TBD), Alternativformulierungen."
         }}
       ]
     }}
@@ -168,24 +213,22 @@ Antworte NUR mit validem JSON in exakt diesem Format:
   "executive_summary": {{
     "total_issues": 0,
     "critical": 0,
-    "important": 0,
-    "neutral": 0,
-    "favorable": 0,
+    "significant": 0,
+    "editorial": 0,
     "key_risks": ["Risiko 1", "Risiko 2"],
     "strategy": "Empfohlene Verhandlungsstrategie in 2-3 Sätzen"
   }}
 }}
 
-Regeln:
-- severity: Nur "KRITISCH", "WICHTIG", "NEUTRAL" oder "VORTEILHAFT"
-- JEDE einzelne Änderung MUSS als eigenes Issue erfasst werden — KEINE Änderung auslassen
-- Erstelle so viele Abschnitte und Issues wie nötig — 50, 100 oder 200 Issues sind völlig normal
-- NICHT zusammenfassen: Jede Änderung = ein separates Issue mit eigenem Ref, eigener Bewertung
-- Kategorien: rechtliche Issues, wirtschaftliche Issues, finanzielle Issues, Haftungsrisiken, Definitionen, Verfahrensfragen
-- old_text und new_text: Gib den relevanten Originaltext an (nicht nur zusammenfassen)
-- Bewerte aus Sicht von {client_party}
-- Sei präzise und praxisorientiert
-- Antworte auf Deutsch
+## QUALITÄTSGRUNDSÄTZE
+- severity: Nur "KRITISCH", "BEDEUTEND" oder "REDAKTIONELL"
+- Ein Issue = ein Thema = eine Zeile; keine Sammelissues
+- ref-Format: "[Sektionsnummer].[laufende Nummer]" (z.B. "3.1", "3.2")
+- label: Immer die genaue Klausel- oder Sectionnummer des Vertrags nennen
+- issue: KONKRET und klauselbezogen — nie allgemein
+- party_a / party_b: Originaltext oder präzise Paraphrase, nicht nur Zusammenfassung
+- comment: Aus Perspektive von {client_party} — Verhandlungsempfehlung, Gegenvorschlag
+- Sprache: Deutsch (Inhalte können Englisch sein wenn der Vertrag auf Englisch ist)
 - NUR valides JSON, keine Erklärungen davor oder danach"""
 
     return prompt
@@ -317,41 +360,78 @@ def _call_claude_api(api_key: str, model: str, prompt: str, max_tokens: int = 16
 def _merge_batch_results(batch_results: List[Dict], document_context: str,
                          client_party: str) -> Dict:
     """Merge multiple batch issue list results into one comprehensive list."""
-    all_sections = []
-    total_critical = 0
-    total_important = 0
-    total_neutral = 0
-    total_favorable = 0
+    # Collect all issues grouped by section title for dedup across batches
+    section_map = {}  # title -> list of issues
     all_key_risks = []
     all_strategies = []
-
-    section_counter = 0
-    issue_counter = 0
 
     for parsed in batch_results:
         if not parsed or "sections" not in parsed:
             continue
 
         for section in parsed.get("sections", []):
-            section_counter += 1
-            section["number"] = _roman(section_counter)
-
-            # Renumber issues
-            for issue in section.get("issues", []):
-                issue_counter += 1
-                issue["ref"] = f"{section_counter}.{issue_counter}"
-
-            all_sections.append(section)
+            title = section.get("title", "Sonstiges")
+            if title not in section_map:
+                section_map[title] = []
+            section_map[title].extend(section.get("issues", []))
 
         summary = parsed.get("executive_summary", {})
-        total_critical += summary.get("critical", 0)
-        total_important += summary.get("important", 0)
-        total_neutral += summary.get("neutral", 0)
-        total_favorable += summary.get("favorable", 0)
         all_key_risks.extend(summary.get("key_risks", []))
         strategy = summary.get("strategy", "")
         if strategy:
             all_strategies.append(strategy)
+
+    # Predefined section order
+    SECTION_ORDER = [
+        "PARTEIEN / STRUKTUR", "DEFINITIONEN", "KAUFPREIS & ZAHLUNGSMECHANIK",
+        "KAUFPREIS", "ZAHLUNGSMECHANIK", "LEAKAGE", "CLOSING CONDITIONS",
+        "CLOSING ACTIONS", "REPRESENTATIONS & WARRANTIES (KÄUFER)",
+        "REPRESENTATIONS & WARRANTIES (VERKÄUFER)", "REPRESENTATIONS & WARRANTIES",
+        "GARANTIEN", "COVENANTS", "HAFTUNG & FREISTELLUNG (LIABILITY)",
+        "HAFTUNG & FREISTELLUNG", "HAFTUNG", "STEUER (TAX INDEMNITY)",
+        "STEUER", "TAX INDEMNITY", "FREISTELLUNGEN (INDEMNITIES)",
+        "FREISTELLUNGEN", "INDEMNITIES", "WETTBEWERBSVERBOT / NON-COMPETE",
+        "WETTBEWERBSVERBOT", "NON-COMPETE",
+        "ALLGEMEINE BESTIMMUNGEN (GENERAL PROVISIONS)",
+        "ALLGEMEINE BESTIMMUNGEN", "GENERAL PROVISIONS",
+    ]
+
+    def section_sort_key(title):
+        t_upper = title.upper()
+        for idx, pattern in enumerate(SECTION_ORDER):
+            if pattern in t_upper or t_upper in pattern:
+                return idx
+        return len(SECTION_ORDER)
+
+    # Build merged sections in order
+    all_sections = []
+    section_counter = 0
+    total_critical = 0
+    total_significant = 0
+    total_editorial = 0
+
+    for title in sorted(section_map.keys(), key=section_sort_key):
+        issues = section_map[title]
+        if not issues:
+            continue
+        section_counter += 1
+        issue_counter = 0
+        for issue in issues:
+            issue_counter += 1
+            issue["ref"] = f"{section_counter}.{issue_counter}"
+            sev = issue.get("severity", "").upper()
+            if sev == "KRITISCH":
+                total_critical += 1
+            elif sev == "BEDEUTEND":
+                total_significant += 1
+            else:
+                total_editorial += 1
+
+        all_sections.append({
+            "number": _roman(section_counter),
+            "title": title,
+            "issues": issues,
+        })
 
     # Deduplicate key risks
     seen_risks = set()
@@ -362,7 +442,7 @@ def _merge_batch_results(batch_results: List[Dict], document_context: str,
             seen_risks.add(r_lower)
             unique_risks.append(r)
 
-    total_issues = total_critical + total_important + total_neutral + total_favorable
+    total_issues = total_critical + total_significant + total_editorial
 
     return {
         "title": f"ISSUE LIST — {document_context or 'Vertrag'}",
@@ -371,9 +451,8 @@ def _merge_batch_results(batch_results: List[Dict], document_context: str,
         "executive_summary": {
             "total_issues": total_issues,
             "critical": total_critical,
-            "important": total_important,
-            "neutral": total_neutral,
-            "favorable": total_favorable,
+            "significant": total_significant,
+            "editorial": total_editorial,
             "key_risks": unique_risks[:10],
             "strategy": " ".join(all_strategies) if all_strategies else "",
         },
@@ -395,7 +474,9 @@ def _roman(n: int) -> str:
 def _filter_relevant_issues(issue_list: Dict, api_key: str, model: str,
                             client_party: str) -> Dict:
     """Second pass: filter issues to keep only legally/economically relevant ones.
-    Removes purely editorial, formatting, and cosmetic changes."""
+    Removes purely editorial, formatting, and cosmetic changes.
+    With the new prompt this should already be well-filtered, but this pass
+    catches any remaining editorial noise."""
     sections = issue_list.get("sections", [])
     if not sections:
         return None
@@ -413,31 +494,20 @@ def _filter_relevant_issues(issue_list: Dict, api_key: str, model: str,
             })
 
     if len(all_issues) <= 10:
-        # Few enough issues, no filtering needed
         return None
 
     issues_json = json.dumps(all_issues, ensure_ascii=False)
 
-    filter_prompt = f"""Du bist ein erfahrener M&A-Anwalt. Ich gebe dir eine Liste von Issues aus einem Vertragsvergleich.
+    filter_prompt = f"""Du bist ein erfahrener M&A-Anwalt auf Verkäuferseite. Filtere diese Issue List.
 
-Filtere die Liste: Behalte NUR Issues mit WIRTSCHAFTLICHER oder RECHTLICHER Relevanz.
+Behalte NUR Issues mit WIRTSCHAFTLICHER oder RECHTLICHER Relevanz für {client_party}.
 
-ENTFERNEN:
-- Rein redaktionelle/sprachliche Änderungen ohne inhaltliche Auswirkung
-- Formatierungsänderungen, Nummerierungsänderungen
-- Tippfehler-Korrekturen
-- Reine Klarstellungen die nichts an der Rechtslage ändern
-- Umformulierungen die denselben Inhalt haben
+ENTFERNEN: Rein redaktionelle/sprachliche Änderungen, Formatierung, Tippfehler,
+Klarstellungen ohne Rechtsfolge, Umformulierungen mit gleichem Inhalt.
 
-BEHALTEN:
-- Änderungen an Rechten, Pflichten, Haftung, Gewährleistungen
-- Kaufpreis, Zahlungsbedingungen, wirtschaftliche Konditionen
-- Fristen, Termine, Bedingungen
-- Definitionen die den Anwendungsbereich ändern
-- Risikoverteilung, Garantien, Freistellungen
-- Wettbewerbsverbote, Geheimhaltung
-- Closing-Bedingungen, MAC-Klauseln
-- Alles was die Position von {client_party} beeinflusst
+BEHALTEN: Rechte, Pflichten, Haftung, Garantien, Kaufpreis, Fristen,
+Definitionen mit Ausstrahlungswirkung, Risikoverteilung, Wettbewerbsverbote,
+Closing-Bedingungen, MAC-Klauseln, alles was die Position von {client_party} beeinflusst.
 
 ISSUES:
 {issues_json}
@@ -458,10 +528,8 @@ NUR das JSON-Array, nichts anderes."""
 
     # Parse the ref list
     try:
-        # Try direct parse
         keep_refs = set(json.loads(raw.strip()))
     except json.JSONDecodeError:
-        # Try to extract array
         match = re.search(r'\[.*?\]', raw, re.DOTALL)
         if match:
             try:
@@ -477,9 +545,8 @@ NUR das JSON-Array, nichts anderes."""
     # Filter sections: keep only issues in keep_refs
     filtered_sections = []
     total_critical = 0
-    total_important = 0
-    total_neutral = 0
-    total_favorable = 0
+    total_significant = 0
+    total_editorial = 0
     section_num = 0
 
     for section in sections:
@@ -498,17 +565,14 @@ NUR das JSON-Array, nichts anderes."""
             sev = issue.get("severity", "").upper()
             if sev == "KRITISCH":
                 total_critical += 1
-            elif sev == "WICHTIG":
-                total_important += 1
-            elif sev == "VORTEILHAFT":
-                total_favorable += 1
+            elif sev == "BEDEUTEND":
+                total_significant += 1
             else:
-                total_neutral += 1
+                total_editorial += 1
 
-    total_issues = total_critical + total_important + total_neutral + total_favorable
+    total_issues = total_critical + total_significant + total_editorial
     original_count = sum(len(s.get("issues", [])) for s in sections)
 
-    # Preserve original summary but update counts
     orig_summary = issue_list.get("executive_summary", {})
 
     return {
@@ -519,9 +583,8 @@ NUR das JSON-Array, nichts anderes."""
         "executive_summary": {
             "total_issues": total_issues,
             "critical": total_critical,
-            "important": total_important,
-            "neutral": total_neutral,
-            "favorable": total_favorable,
+            "significant": total_significant,
+            "editorial": total_editorial,
             "key_risks": orig_summary.get("key_risks", []),
             "strategy": orig_summary.get("strategy", ""),
         },

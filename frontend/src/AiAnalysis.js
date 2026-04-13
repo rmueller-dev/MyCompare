@@ -1,16 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 const API = '/api';
 
 const SEV = {
-  KRITISCH:    { bg: 'bg-red-100',    text: 'text-red-800',    border: 'border-red-300',    dot: 'bg-red-500' },
-  WICHTIG:     { bg: 'bg-orange-100', text: 'text-orange-800', border: 'border-orange-300', dot: 'bg-orange-500' },
-  NEUTRAL:     { bg: 'bg-gray-100',   text: 'text-gray-700',   border: 'border-gray-300',   dot: 'bg-gray-400' },
-  VORTEILHAFT: { bg: 'bg-green-100',  text: 'text-green-800',  border: 'border-green-300',  dot: 'bg-green-500' },
+  KRITISCH:     { bg: 'bg-red-50',    text: 'text-red-800',    border: 'border-red-300',    dot: 'bg-red-500',    rowBg: '#FDEDEC' },
+  BEDEUTEND:    { bg: 'bg-yellow-50',  text: 'text-yellow-800', border: 'border-yellow-300', dot: 'bg-yellow-500', rowBg: '#FEF9E7' },
+  REDAKTIONELL: { bg: 'bg-white',      text: 'text-gray-600',   border: 'border-gray-300',   dot: 'bg-gray-400',   rowBg: '#FFFFFF' },
 };
 
 function SeverityBadge({ severity }) {
-  const s = SEV[severity?.toUpperCase()] || SEV.NEUTRAL;
+  const s = SEV[severity?.toUpperCase()] || SEV.REDAKTIONELL;
   return (
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold ${s.bg} ${s.text}`}>
       <span className={`w-2 h-2 rounded-full ${s.dot}`}></span>
@@ -19,52 +18,45 @@ function SeverityBadge({ severity }) {
   );
 }
 
-function IssueTable({ section }) {
+function IssueTable({ section, clientParty }) {
   return (
     <div className="mb-6">
-      <div className="bg-[#1F3864] text-white px-4 py-2 rounded-t-lg">
+      <div className="bg-[#2E5FA3] text-white px-4 py-2 rounded-t-lg">
         <h3 className="font-bold text-sm">{section.number}. {section.title}</h3>
       </div>
-      {section.summary && (
-        <p className="text-xs text-gray-600 italic px-4 py-2 bg-gray-50 border-x border-gray-200">
-          {section.summary}
-        </p>
-      )}
       <div className="overflow-x-auto">
         <table className="w-full text-xs border-collapse border border-gray-300">
           <thead>
             <tr className="bg-[#1F3864] text-white">
-              <th className="px-2 py-2 text-left w-16 border border-gray-500">Ref.</th>
-              <th className="px-2 py-2 text-left border border-gray-500">Issue / Change</th>
-              <th className="px-2 py-2 text-left w-32 border border-gray-500">Version A (Alt)</th>
-              <th className="px-2 py-2 text-left w-32 border border-gray-500">Version B (Neu)</th>
-              <th className="px-2 py-2 text-left w-36 border border-gray-500">Kommentar</th>
+              <th className="px-2 py-2 text-left w-10 border border-gray-500">Nr.</th>
+              <th className="px-2 py-2 text-left w-24 border border-gray-500">Ref.</th>
+              <th className="px-2 py-2 text-left border border-gray-500" style={{minWidth:'200px'}}>Issue / Änderung</th>
+              <th className="px-2 py-2 text-left w-36 border border-gray-500">Position {clientParty || 'Partei A'}</th>
+              <th className="px-2 py-2 text-left w-36 border border-gray-500">Position Gegenseite</th>
+              <th className="px-2 py-2 text-left w-44 border border-gray-500">Kommentare / Empfehlung</th>
             </tr>
           </thead>
           <tbody>
             {(section.issues || []).map((issue, i) => {
-              const sev = issue.severity?.toUpperCase() || 'NEUTRAL';
-              const s = SEV[sev] || SEV.NEUTRAL;
+              const sev = issue.severity?.toUpperCase() || 'REDAKTIONELL';
+              const s = SEV[sev] || SEV.REDAKTIONELL;
               return (
-                <tr key={i} className="border-b border-gray-200 hover:bg-gray-50">
-                  <td className={`px-2 py-2 border border-gray-200 align-top ${s.bg}`}>
-                    <div className="font-bold">{issue.ref}</div>
-                    {issue.label && <div className="font-semibold text-[10px] mt-0.5">{issue.label}</div>}
+                <tr key={i} className="border-b border-gray-200" style={{backgroundColor: s.rowBg}}>
+                  <td className="px-2 py-2 border border-gray-200 align-top font-bold text-center">
+                    {i + 1}
+                  </td>
+                  <td className="px-2 py-2 border border-gray-200 align-top">
+                    <div className="font-bold text-[10px]">{issue.label || issue.ref}</div>
                   </td>
                   <td className="px-2 py-2 border border-gray-200 align-top">
                     <SeverityBadge severity={sev} />
                     <p className="mt-1">{issue.issue}</p>
-                    {issue.recommendation && (
-                      <p className={`mt-1 font-bold ${s.text}`}>
-                        Empfehlung: {issue.recommendation}
-                      </p>
-                    )}
                   </td>
-                  <td className="px-2 py-2 border border-gray-200 align-top text-gray-600">
-                    {issue.old_text}
+                  <td className="px-2 py-2 border border-gray-200 align-top text-gray-700">
+                    {issue.party_a || issue.sell_side || issue.old_text || ''}
                   </td>
-                  <td className="px-2 py-2 border border-gray-200 align-top text-gray-600">
-                    {issue.new_text}
+                  <td className="px-2 py-2 border border-gray-200 align-top text-gray-700">
+                    {issue.party_b || issue.buy_side || issue.new_text || ''}
                   </td>
                   <td className="px-2 py-2 border border-gray-200 align-top">
                     {issue.comment}
@@ -102,13 +94,21 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [elapsed, setElapsed] = useState(0);
+  const [jobPhase, setJobPhase] = useState('');
+  const pollRef = useRef(null);
 
+  // Timer for elapsed seconds during loading
   useEffect(() => {
     if (step !== 'loading') return;
     setElapsed(0);
     const iv = setInterval(() => setElapsed(e => e + 1), 1000);
     return () => clearInterval(iv);
   }, [step]);
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
 
   useEffect(() => {
     fetch(`${API}/ai/status`)
@@ -117,7 +117,6 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
         setOllamaAvailable(data.available);
         setOllamaModels(data.models || []);
         if (data.models?.length > 0) setModel(data.models[0]);
-
         const p = data.providers || {};
         if (p.claude) {
           setClaudeAvailable(p.claude.available);
@@ -161,6 +160,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
     if (!clientParty.trim()) return;
     setStep('loading');
     setError('');
+    setJobPhase('Änderungen werden aufbereitet...');
     try {
       const resp = await fetch(
         `${API}/ai/analyze/${docId}/${versionA}/${versionB}`,
@@ -177,10 +177,18 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
         }
       );
       const data = await resp.json();
+
       if (data.error) {
         setError(data.error);
         setStep('error');
+        return;
+      }
+
+      // If we get a job_id back, start polling
+      if (data.job_id) {
+        startPolling(data.job_id);
       } else {
+        // Direct result (legacy / no-changes case)
         setResult(data);
         setStep('result');
       }
@@ -190,11 +198,46 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
     }
   };
 
+  const startPolling = (jobId) => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const resp = await fetch(`${API}/ai/job/${jobId}`);
+        const data = await resp.json();
+
+        if (data.error) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          setError(data.error);
+          setStep('error');
+          return;
+        }
+
+        if (data.status === 'queued' || data.status === 'running') {
+          setJobPhase(data.phase || 'Analyse läuft...');
+          return; // keep polling
+        }
+
+        // Done — data IS the result
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+        setResult(data);
+        setStep('result');
+      } catch {
+        // Network glitch — keep polling, don't fail
+      }
+    }, 2000);
+  };
+
   const handleExportDocx = async () => {
     try {
       const body = result.structured
-        ? { issue_list: result.issue_list, client_party: result.client_party, model: result.model, change_count: result.change_count }
-        : { analysis: result.analysis || result.raw, client_party: result.client_party, model: result.model, change_count: result.change_count };
+        ? { issue_list: result.issue_list, client_party: result.client_party || clientParty,
+            model: result.model, change_count: result.change_count,
+            document_context: documentContext }
+        : { analysis: result.analysis || result.raw, client_party: result.client_party || clientParty,
+            model: result.model, change_count: result.change_count,
+            document_context: documentContext };
       const resp = await fetch(`${API}/ai/export-docx`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -204,7 +247,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `IssueList_${result.client_party}.docx`;
+      a.download = `IssueList_${result.client_party || clientParty}.docx`;
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
@@ -218,7 +261,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-2xl shadow-2xl max-w-5xl w-full max-h-[90vh] flex flex-col">
+      <div className="bg-white rounded-2xl shadow-2xl max-w-6xl w-full max-h-[90vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b bg-gradient-to-r from-[#1F3864] to-[#2D5AA0] rounded-t-2xl">
           <div className="flex items-center gap-3">
@@ -241,7 +284,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
           {step === 'form' && (
             <div className="space-y-4">
               <p className="text-gray-600 text-sm">
-                Die AI erstellt eine professionelle Issue List mit Ampelsystem, Tabellenformat und Handlungsempfehlungen.
+                Die AI erstellt eine professionelle Issue List mit Ampelsystem (Kritisch / Bedeutend / Redaktionell), 6-Spalten-Tabelle und Handlungsempfehlungen.
               </p>
 
               {/* Provider Selection */}
@@ -285,36 +328,25 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
                         <code className="text-xs text-violet-600 bg-violet-100 px-1.5 py-0.5 rounded">{claudeKeyPreview}</code>
                       </div>
                       <button onClick={() => setShowApiKeyInput(true)}
-                        className="text-xs text-violet-600 hover:text-violet-800 underline">
-                        Ändern
-                      </button>
+                        className="text-xs text-violet-600 hover:text-violet-800 underline">Ändern</button>
                     </div>
                   ) : (
                     <div>
-                      <label className="block text-xs font-semibold text-violet-800 mb-1">
-                        Anthropic API-Key
-                      </label>
+                      <label className="block text-xs font-semibold text-violet-800 mb-1">Anthropic API-Key</label>
                       <div className="flex gap-2">
                         <input type="password" value={apiKeyInput}
                           onChange={e => setApiKeyInput(e.target.value)}
                           placeholder="sk-ant-api03-..."
                           className="flex-1 border border-violet-300 rounded px-2 py-1.5 text-sm focus:ring-2 focus:ring-violet-500 font-mono"
-                          onKeyDown={e => e.key === 'Enter' && handleSaveApiKey()}
-                        />
+                          onKeyDown={e => e.key === 'Enter' && handleSaveApiKey()} />
                         <button onClick={handleSaveApiKey}
-                          className="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded text-sm font-medium">
-                          Speichern
-                        </button>
+                          className="px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded text-sm font-medium">Speichern</button>
                         {claudeHasKey && (
                           <button onClick={() => setShowApiKeyInput(false)}
-                            className="px-2 py-1.5 text-violet-600 hover:text-violet-800 text-sm">
-                            Abbrechen
-                          </button>
+                            className="px-2 py-1.5 text-violet-600 hover:text-violet-800 text-sm">Abbrechen</button>
                         )}
                       </div>
-                      <p className="text-[10px] text-violet-500 mt-1">
-                        Key von console.anthropic.com — wird lokal gespeichert
-                      </p>
+                      <p className="text-[10px] text-violet-500 mt-1">Key von console.anthropic.com — wird lokal gespeichert</p>
                     </div>
                   )}
                 </div>
@@ -332,9 +364,9 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
               )}
 
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-1">Wen vertreten Sie? *</label>
+                <label className="block text-sm font-semibold text-gray-700 mb-1">Beauftragende Partei *</label>
                 <input type="text" value={clientParty} onChange={e => setClientParty(e.target.value)}
-                  placeholder="z.B. Käufer, Verkäufer GmbH, Mieter, Lizenzgeber..."
+                  placeholder="z.B. Verkäufer GmbH, Käufer AG, Lizenzgeber, Darlehensnehmer..."
                   className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500" autoFocus />
               </div>
 
@@ -356,7 +388,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
               <div>
                 <label className="block text-sm font-semibold text-gray-700 mb-1">Dokumenttyp (optional)</label>
                 <input type="text" value={documentContext} onChange={e => setDocumentContext(e.target.value)}
-                  placeholder="z.B. SPA, Kaufvertrag, Mietvertrag, NDA..."
+                  placeholder="z.B. SPA, SHA, NDA, Lizenzvertrag, Kreditvertrag..."
                   className="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500" />
               </div>
 
@@ -398,14 +430,10 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
           {step === 'loading' && (() => {
             const isClaude = provider === 'claude';
             const numChanges = changeCount || 50;
-
-            // Realistic time estimate based on actual change count
-            // Claude: ~50 changes per batch, ~15s per batch + 3s pause between
-            // Ollama: all at once but slow generation, ~2s per change
             let estimatedSeconds;
             if (isClaude) {
               const numBatches = Math.ceil(numChanges / 50);
-              estimatedSeconds = numBatches * 18 + 25; // 18s per batch (15s + 3s pause) + 25s for filter pass
+              estimatedSeconds = numBatches * 18 + 25;
             } else {
               estimatedSeconds = Math.max(120, numChanges * 2);
             }
@@ -418,31 +446,11 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
             const remainMins = Math.floor(remainSecs / 60);
             const remainS = remainSecs % 60;
 
-            // Claude batch-aware phases
-            const numBatches = Math.ceil(numChanges / 50);
-            const secsPerBatch = estimatedSeconds / numBatches;
-            const currentBatch = Math.min(numBatches, Math.floor(elapsed / secsPerBatch) + 1);
-
-            let phase;
-            if (isClaude) {
-              if (pct < 3) phase = `${numChanges} Änderungen werden in ${numBatches} Batches aufgeteilt...`;
-              else if (pct < 90) phase = `Batch ${currentBatch} von ${numBatches} wird analysiert...`;
-              else if (pct < 95) phase = 'Relevanzfilter: nur wirtschaftlich/rechtlich relevante Issues...';
-              else phase = 'Issue List wird zusammengeführt...';
-            } else {
-              if (pct < 5) phase = 'Änderungen werden aufbereitet...';
-              else if (pct < 20) phase = 'Prompt wird an LLM gesendet...';
-              else if (pct < 50) phase = 'AI analysiert die Klauseln...';
-              else if (pct < 75) phase = 'Risikobewertung läuft...';
-              else if (pct < 90) phase = 'Issue List wird strukturiert...';
-              else phase = 'Analyse wird abgeschlossen...';
-            }
-
             return (
               <div className="py-8 space-y-6">
                 <div className="text-center">
                   <div className={`inline-block w-10 h-10 border-4 ${isClaude ? 'border-violet-200 border-t-violet-600' : 'border-blue-200 border-t-[#1F3864]'} rounded-full animate-spin mb-3`}></div>
-                  <p className="text-gray-700 font-semibold">{phase}</p>
+                  <p className="text-gray-700 font-semibold">{jobPhase || 'Analyse läuft...'}</p>
                   <p className="text-gray-400 text-sm mt-1">
                     {mins > 0 ? `${mins}:${secs.toString().padStart(2,'0')}` : `${secs}s`} vergangen
                     {remainSecs > 5 && <span className="ml-2">| ca. {remainMins > 0 ? `${remainMins}:${remainS.toString().padStart(2,'0')}` : `${remainSecs}s`} verbleibend</span>}
@@ -452,7 +460,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
                   <div className={`h-full rounded-full transition-all duration-1000 ${isClaude ? 'bg-gradient-to-r from-violet-500 to-violet-600' : 'bg-gradient-to-r from-[#1F3864] to-[#2D5AA0]'}`} style={{width:`${pct}%`}}></div>
                 </div>
                 <p className="text-center text-xs text-gray-400">
-                  {numChanges} Änderungen{isClaude ? ` in ${numBatches} Batches` : ''} | Geschätzt ca. {estMins} {estMins === 1 ? 'Minute' : 'Minuten'} ({isClaude ? CLAUDE_MODEL_NAMES[model] || model : model || 'qwen2.5:14b'})
+                  {numChanges} Änderungen | Geschätzt ca. {estMins} {estMins === 1 ? 'Minute' : 'Minuten'} ({isClaude ? CLAUDE_MODEL_NAMES[model] || model : model || 'qwen2.5:14b'})
                 </p>
               </div>
             );
@@ -477,20 +485,26 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
                   <span className={result.provider === 'claude' ? 'text-violet-300' : ''}>
                     {result.provider === 'claude' ? `Claude (${CLAUDE_MODEL_NAMES[result.model] || result.model})` : result.model}
                   </span>
-                  {' '}| {result.change_count} Änderungen{result.batches > 1 ? ` (${result.batches} Batches)` : ''}
+                  {' '}| {result.change_count} Änderungen
                 </p>
                 {issueList.filter_note && (
                   <p className="text-xs text-green-300 mt-0.5">{issueList.filter_note}</p>
                 )}
               </div>
 
+              {/* Legend */}
+              <div className="flex gap-2 text-xs">
+                <span className="px-3 py-1 rounded font-semibold" style={{backgroundColor:'#FDEDEC', color:'#991B1B'}}>KRITISCH</span>
+                <span className="px-3 py-1 rounded font-semibold" style={{backgroundColor:'#FEF9E7', color:'#92400E'}}>BEDEUTEND</span>
+                <span className="px-3 py-1 rounded border border-gray-300 font-semibold text-gray-600">REDAKTIONELL</span>
+              </div>
+
               {/* Summary stats */}
               {summary && (
-                <div className="grid grid-cols-4 gap-2">
-                  {[['critical','Kritisch','bg-red-100 text-red-800 border-red-200'],
-                    ['important','Wichtig','bg-orange-100 text-orange-800 border-orange-200'],
-                    ['neutral','Neutral','bg-gray-100 text-gray-700 border-gray-200'],
-                    ['favorable','Vorteilhaft','bg-green-100 text-green-800 border-green-200']
+                <div className="grid grid-cols-3 gap-2">
+                  {[['critical','Kritisch','bg-red-50 text-red-800 border-red-200'],
+                    ['significant','Bedeutend','bg-yellow-50 text-yellow-800 border-yellow-200'],
+                    ['editorial','Redaktionell','bg-gray-50 text-gray-700 border-gray-200'],
                   ].map(([k, label, cls]) => (
                     <div key={k} className={`text-center px-3 py-2 rounded-lg border ${cls}`}>
                       <div className="text-2xl font-bold">{summary[k] || 0}</div>
@@ -520,7 +534,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
 
               {/* Issue tables per section */}
               {(issueList.sections || []).map((sec, i) => (
-                <IssueTable key={i} section={sec} />
+                <IssueTable key={i} section={sec} clientParty={result.client_party || clientParty} />
               ))}
 
               {/* Actions */}
@@ -530,7 +544,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
-                  Als Word speichern
+                  Als Word speichern (A4 Querformat)
                 </button>
                 <button onClick={() => { setStep('form'); setResult(null); }}
                   className="px-4 py-2 border border-gray-300 hover:bg-gray-50 rounded-lg text-sm font-medium text-gray-700">
@@ -546,7 +560,7 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
               <div className="flex items-center gap-2 text-sm text-gray-500">
                 <span className="bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full text-xs font-medium">{result.model}</span>
                 <span>{result.change_count} Änderungen</span>
-                <span>| Mandant: {result.client_party}</span>
+                <span>| {result.client_party || clientParty}</span>
               </div>
               <div className="bg-gray-50 border rounded-lg p-4">
                 <pre className="whitespace-pre-wrap text-sm text-gray-800 font-sans leading-relaxed">{result.analysis || result.raw}</pre>

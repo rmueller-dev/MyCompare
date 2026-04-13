@@ -1,6 +1,7 @@
 """Flask API routes."""
 import os
 import uuid
+import threading
 from flask import Blueprint, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from .models import SessionLocal, Document, Version, RenderingSet, Folder, STORAGE_DIR
@@ -8,6 +9,9 @@ from .extractors import extract
 from .diff_engine import compute_diff
 from .image_diff import extract_images, compare_images
 from .ai_analysis import analyze_changes, _check_ollama, get_providers_status, set_api_key, get_api_key
+
+# ── In-memory job store for async AI analysis ──
+_ai_jobs = {}  # job_id -> {status, progress, result, error}
 
 api = Blueprint('api', __name__, url_prefix='/api')
 
@@ -3700,13 +3704,46 @@ def ai_get_api_key():
     })
 
 
+def _run_ai_job(job_id, analysis_changes, client_party, document_context,
+                model, client_version, provider, total_changes, truncated):
+    """Background worker for AI analysis — runs in a separate thread."""
+    try:
+        _ai_jobs[job_id]['status'] = 'running'
+        _ai_jobs[job_id]['phase'] = 'Analyse wird gestartet...'
+
+        result = analyze_changes(
+            analysis_changes,
+            client_party=client_party,
+            document_context=document_context,
+            model=model,
+            client_version=client_version,
+            provider=provider,
+        )
+
+        if truncated:
+            result['truncated'] = True
+            result['total_changes'] = total_changes
+
+        if result.get('error'):
+            _ai_jobs[job_id]['status'] = 'error'
+            _ai_jobs[job_id]['error'] = result['error']
+        else:
+            _ai_jobs[job_id]['status'] = 'done'
+            _ai_jobs[job_id]['result'] = result
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _ai_jobs[job_id]['status'] = 'error'
+        _ai_jobs[job_id]['error'] = str(e)
+
+
 @api.route('/ai/analyze/<int:doc_id>/<int:version_a>/<int:version_b>',
            methods=['POST'])
 def ai_analyze(doc_id, version_a, version_b):
     """
-    Generate an AI-powered issue list from the changes between two versions.
-    Requires JSON body: { "client_party": "Käufer" }
-    Optional: { "model": "...", "document_context": "...", "provider": "ollama"|"claude" }
+    Start an async AI analysis job. Returns a job_id immediately.
+    Poll /ai/job/<job_id> for progress and results.
     """
     data = request.get_json() or {}
     client_party = data.get('client_party', '').strip()
@@ -3797,24 +3834,35 @@ def ai_analyze(doc_id, version_a, version_b):
             ch_copy['new'] = new[:500]
             significant_changes.append(ch_copy)
 
-        # Send ALL changes — thoroughness over speed
         analysis_changes = significant_changes
         truncated = len(changes) > len(significant_changes)
 
-        result = analyze_changes(
-            analysis_changes,
-            client_party=client_party,
-            document_context=document_context or doc.name,
-            model=model,
-            client_version=client_version,
-            provider=provider,
+        # Create async job
+        job_id = str(uuid.uuid4())[:12]
+        _ai_jobs[job_id] = {
+            'status': 'queued',
+            'phase': 'Änderungen werden aufbereitet...',
+            'change_count': len(analysis_changes),
+            'provider': provider,
+            'model': model,
+            'client_party': client_party,
+        }
+
+        # Start background thread
+        t = threading.Thread(
+            target=_run_ai_job,
+            args=(job_id, analysis_changes, client_party,
+                  document_context or doc.name, model, client_version,
+                  provider, len(changes), truncated),
+            daemon=True,
         )
+        t.start()
 
-        if truncated:
-            result['truncated'] = True
-            result['total_changes'] = len(changes)
-
-        return jsonify(result)
+        return jsonify({
+            'status': 'started',
+            'job_id': job_id,
+            'change_count': len(analysis_changes),
+        })
 
     except Exception as e:
         import traceback
@@ -3824,15 +3872,44 @@ def ai_analyze(doc_id, version_a, version_b):
         session.close()
 
 
+@api.route('/ai/job/<job_id>', methods=['GET'])
+def ai_job_status(job_id):
+    """Poll for AI analysis job status and results."""
+    job = _ai_jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job nicht gefunden'}), 404
+
+    if job['status'] == 'done':
+        result = job.get('result', {})
+        # Clean up after delivering result
+        del _ai_jobs[job_id]
+        return jsonify(result)
+
+    if job['status'] == 'error':
+        error = job.get('error', 'Unbekannter Fehler')
+        del _ai_jobs[job_id]
+        return jsonify({'status': 'error', 'error': error})
+
+    # Still running
+    return jsonify({
+        'status': job['status'],
+        'phase': job.get('phase', ''),
+        'change_count': job.get('change_count', 0),
+        'provider': job.get('provider', ''),
+    })
+
+
 @api.route('/ai/export-docx', methods=['POST'])
 def ai_export_docx():
-    """Export AI analysis as a professional Word document with tables."""
+    """Export AI analysis as a professional Word document — A4 Landscape, 6-column M&A format."""
     import tempfile
     from docx import Document as DocxDocument
-    from docx.shared import Pt, RGBColor, Inches, Cm, Emu
+    from docx.shared import Pt, RGBColor, Cm, Emu, Twips
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.enum.section import WD_ORIENT
     from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
     from datetime import datetime
 
     data = request.get_json() or {}
@@ -3840,8 +3917,8 @@ def ai_export_docx():
     client_party = data.get('client_party', 'Mandant')
     model_name = data.get('model', '')
     change_count = data.get('change_count', 0)
+    document_context = data.get('document_context', '')
 
-    # Fallback for unstructured
     if not issue_list:
         raw = data.get('analysis', data.get('raw', ''))
         issue_list = {'title': 'AI Issue List', 'sections': [],
@@ -3850,31 +3927,59 @@ def ai_export_docx():
 
     doc = DocxDocument()
 
-    SEVERITY_COLORS = {
-        'KRITISCH': RGBColor(220, 38, 38),
-        'WICHTIG': RGBColor(234, 88, 12),
-        'NEUTRAL': RGBColor(100, 100, 100),
-        'VORTEILHAFT': RGBColor(22, 163, 74),
+    # ── Page setup: A4 Landscape, 1cm margins ──
+    section = doc.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width = Cm(29.7)
+    section.page_height = Cm(21.0)
+    section.left_margin = Cm(1.0)
+    section.right_margin = Cm(1.0)
+    section.top_margin = Cm(1.0)
+    section.bottom_margin = Cm(1.0)
+
+    # Color constants
+    DARK_BLUE = '1F3864'
+    MID_BLUE = '2E5FA3'
+    RED_BG = 'FDEDEC'
+    YELLOW_BG = 'FEF9E7'
+    WHITE_BG = 'FFFFFF'
+    DARK_BLUE_RGB = RGBColor(0x1F, 0x38, 0x64)
+    MID_BLUE_RGB = RGBColor(0x2E, 0x5F, 0xA3)
+    WHITE_RGB = RGBColor(255, 255, 255)
+    RED_RGB = RGBColor(200, 30, 30)
+
+    SEVERITY_ROW_BG = {
+        'KRITISCH': RED_BG,
+        'BEDEUTEND': YELLOW_BG,
+        'REDAKTIONELL': WHITE_BG,
     }
-    SEVERITY_BG = {
-        'KRITISCH': 'FFCCCC',
-        'WICHTIG': 'FFE4CC',
-        'NEUTRAL': 'F5F5F5',
-        'VORTEILHAFT': 'CCFFCC',
-    }
-    HEADER_BG = '1F3864'
-    HEADER_TEXT = RGBColor(255, 255, 255)
+
+    # Column widths in DXA (1 DXA = 1/20 pt = 1/1440 inch)
+    COL_WIDTHS_DXA = [500, 1500, 4500, 2100, 2400, 3838]
+
+    def dxa_to_emu(dxa):
+        return int(dxa * 914400 / 1440)
 
     def set_cell_bg(cell, color_hex):
-        shading = cell._element.get_or_add_tcPr()
-        shd = shading.makeelement(qn('w:shd'), {
-            qn('w:fill'): color_hex, qn('w:val'): 'clear'})
-        shading.append(shd)
+        tc_pr = cell._element.get_or_add_tcPr()
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:fill'), color_hex)
+        shd.set(qn('w:val'), 'clear')
+        tc_pr.append(shd)
 
-    def add_cell_text(cell, text, bold=False, size=8, color=None):
+    def set_cell_width(cell, dxa):
+        tc_pr = cell._element.get_or_add_tcPr()
+        tc_w = OxmlElement('w:tcW')
+        tc_w.set(qn('w:w'), str(dxa))
+        tc_w.set(qn('w:type'), 'dxa')
+        tc_pr.append(tc_w)
+
+    def add_cell_text(cell, text, bold=False, size=8, color=None, alignment=None):
         p = cell.paragraphs[0]
-        p.paragraph_format.space_before = Pt(2)
-        p.paragraph_format.space_after = Pt(2)
+        p.paragraph_format.space_before = Pt(1)
+        p.paragraph_format.space_after = Pt(1)
+        if alignment:
+            p.alignment = alignment
         run = p.add_run(str(text) if text else '')
         run.font.size = Pt(size)
         run.font.name = 'Calibri'
@@ -3883,165 +3988,360 @@ def ai_export_docx():
         if color:
             run.font.color.rgb = color
 
-    # ── Title ──
-    title = doc.add_heading(issue_list.get('title', 'ISSUE LIST'), level=0)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    for run in title.runs:
-        run.font.color.rgb = RGBColor(31, 56, 100)
+    def add_seq_field(paragraph, section_num):
+        """Add a SEQ field for automatic numbering: {section_num}.{SEQ seq_s ARABIC}"""
+        run_prefix = paragraph.add_run(f'{section_num}.')
+        run_prefix.font.size = Pt(8)
+        run_prefix.font.name = 'Calibri'
+        run_prefix.bold = True
+        # Create SEQ field
+        r = OxmlElement('w:r')
+        rPr = OxmlElement('w:rPr')
+        sz = OxmlElement('w:sz')
+        sz.set(qn('w:val'), '16')  # 8pt = 16 half-points
+        rPr.append(sz)
+        rFonts = OxmlElement('w:rFonts')
+        rFonts.set(qn('w:ascii'), 'Calibri')
+        rFonts.set(qn('w:hAnsi'), 'Calibri')
+        rPr.append(rFonts)
+        bEl = OxmlElement('w:b')
+        rPr.append(bEl)
+        r.append(rPr)
+        fld_begin = OxmlElement('w:fldChar')
+        fld_begin.set(qn('w:fldCharType'), 'begin')
+        r.append(fld_begin)
+        paragraph._element.append(r)
 
-    # Subtitle
-    sub = doc.add_paragraph()
-    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = sub.add_run(f'{issue_list.get("subtitle", "")} | {model_name} | '
-                    f'Erstellt: {datetime.now().strftime("%d.%m.%Y %H:%M")}')
-    r.font.size = Pt(9)
-    r.font.color.rgb = RGBColor(128, 128, 128)
+        r2 = OxmlElement('w:r')
+        r2.append(rPr.__deepcopy__(True))
+        instr = OxmlElement('w:instrText')
+        instr.set(qn('xml:space'), 'preserve')
+        instr.text = f' SEQ s{section_num} \\* ARABIC '
+        r2.append(instr)
+        paragraph._element.append(r2)
 
-    # Confidential marker
-    conf = doc.add_paragraph()
-    conf.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = conf.add_run('VERTRAULICH | NUR FÜR INTERNE ZWECKE')
-    r.font.size = Pt(8)
-    r.font.color.rgb = RGBColor(180, 0, 0)
-    r.bold = True
+        r3 = OxmlElement('w:r')
+        r3.append(rPr.__deepcopy__(True))
+        fld_sep = OxmlElement('w:fldChar')
+        fld_sep.set(qn('w:fldCharType'), 'separate')
+        r3.append(fld_sep)
+        paragraph._element.append(r3)
 
-    # ── Executive Summary ──
+        r4 = OxmlElement('w:r')
+        r4.append(rPr.__deepcopy__(True))
+        t = OxmlElement('w:t')
+        t.text = '1'  # placeholder, updated on F9
+        r4.append(t)
+        paragraph._element.append(r4)
+
+        r5 = OxmlElement('w:r')
+        r5.append(rPr.__deepcopy__(True))
+        fld_end = OxmlElement('w:fldChar')
+        fld_end.set(qn('w:fldCharType'), 'end')
+        r5.append(fld_end)
+        paragraph._element.append(r5)
+
+    def make_header_row(table, row_idx, headers):
+        for i, h in enumerate(headers):
+            cell = table.cell(row_idx, i)
+            set_cell_bg(cell, DARK_BLUE)
+            set_cell_width(cell, COL_WIDTHS_DXA[i])
+            add_cell_text(cell, h, bold=True, size=8, color=WHITE_RGB)
+
+    def make_section_header_row(table, row_idx, text, num_cols=6):
+        """Merge all cells into one section header row."""
+        first = table.cell(row_idx, 0)
+        last = table.cell(row_idx, num_cols - 1)
+        merged = first.merge(last)
+        set_cell_bg(merged, MID_BLUE)
+        add_cell_text(merged, text, bold=True, size=9, color=WHITE_RGB)
+
+    now_str = datetime.now().strftime('%d.%m.%Y')
+    doc_title = issue_list.get('title', 'ISSUE LIST')
+
+    # ═══════════════════════════════════════════════════════════════
+    # DECKBLATT (Cover table)
+    # ═══════════════════════════════════════════════════════════════
+    cover = doc.add_table(rows=5, cols=2)
+    cover.alignment = WD_TABLE_ALIGNMENT.CENTER
+    cover_data = [
+        ('Projekt', client_party),
+        ('Dokument', document_context or issue_list.get('title', 'Vertrag')),
+        ('Datum', now_str),
+        ('Erstellt durch', f'MyCompare AI ({model_name})'),
+        ('Status', 'VERTRAULICH — NUR FÜR INTERNE ZWECKE'),
+    ]
+    for i, (label, val) in enumerate(cover_data):
+        lc = cover.cell(i, 0)
+        set_cell_bg(lc, DARK_BLUE)
+        set_cell_width(lc, 3000)
+        add_cell_text(lc, label, bold=True, size=10, color=WHITE_RGB)
+        vc = cover.cell(i, 1)
+        is_conf = (label == 'Status')
+        add_cell_text(vc, val, bold=is_conf, size=10,
+                      color=RED_RGB if is_conf else None)
+
+    doc.add_paragraph()  # spacer
+
+    # ═══════════════════════════════════════════════════════════════
+    # LEGENDE
+    # ═══════════════════════════════════════════════════════════════
+    legend_tbl = doc.add_table(rows=1, cols=3)
+    legend_tbl.alignment = WD_TABLE_ALIGNMENT.LEFT
+    for i, (label, bg, desc) in enumerate([
+        ('KRITISCH', RED_BG, 'Hohes Risiko — sofort adressieren'),
+        ('BEDEUTEND', YELLOW_BG, 'Mittleres Risiko — nachverhandeln'),
+        ('REDAKTIONELL', WHITE_BG, 'Geringes Risiko — ggf. akzeptieren'),
+    ]):
+        cell = legend_tbl.cell(0, i)
+        set_cell_bg(cell, bg)
+        p = cell.paragraphs[0]
+        p.paragraph_format.space_before = Pt(2)
+        p.paragraph_format.space_after = Pt(2)
+        r = p.add_run(f'{label}: ')
+        r.font.size = Pt(8)
+        r.font.name = 'Calibri'
+        r.bold = True
+        r2 = p.add_run(desc)
+        r2.font.size = Pt(8)
+        r2.font.name = 'Calibri'
+
+    doc.add_paragraph()  # spacer
+
+    # ═══════════════════════════════════════════════════════════════
+    # EXECUTIVE SUMMARY (strategy + key risks)
+    # ═══════════════════════════════════════════════════════════════
     summary = issue_list.get('executive_summary', {})
-    if summary:
-        doc.add_heading('EXECUTIVE SUMMARY', level=1)
+    if summary and (summary.get('strategy') or summary.get('key_risks')):
+        h = doc.add_paragraph()
+        hr = h.add_run('ZUSAMMENFASSUNG')
+        hr.font.size = Pt(11)
+        hr.font.name = 'Calibri'
+        hr.bold = True
+        hr.font.color.rgb = DARK_BLUE_RGB
+
         if summary.get('strategy'):
             p = doc.add_paragraph()
-            p.add_run(summary['strategy']).font.size = Pt(10)
-
-        # Summary stats table
-        stats = []
-        for key, label, color in [
-            ('critical', 'Kritisch', 'FFCCCC'),
-            ('important', 'Wichtig', 'FFE4CC'),
-            ('neutral', 'Neutral', 'F5F5F5'),
-            ('favorable', 'Vorteilhaft', 'CCFFCC'),
-        ]:
-            val = summary.get(key, 0)
-            if val:
-                stats.append((label, val, color))
-
-        if stats:
-            tbl = doc.add_table(rows=1, cols=len(stats))
-            tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-            for i, (label, val, bg) in enumerate(stats):
-                cell = tbl.cell(0, i)
-                set_cell_bg(cell, bg)
-                p = cell.paragraphs[0]
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                r = p.add_run(f'{label}: {val}')
-                r.font.size = Pt(9)
-                r.bold = True
+            r = p.add_run(summary['strategy'])
+            r.font.size = Pt(9)
+            r.font.name = 'Calibri'
 
         if summary.get('key_risks'):
-            doc.add_heading('Kritische Punkte', level=2)
             for risk in summary['key_risks']:
                 p = doc.add_paragraph(style='List Bullet')
                 r = p.add_run(risk)
-                r.font.size = Pt(10)
+                r.font.size = Pt(9)
+                r.font.name = 'Calibri'
 
-    # ── Sections with Issue Tables ──
+        doc.add_paragraph()
+
+    # ═══════════════════════════════════════════════════════════════
+    # SECTION TABLES (6 columns each)
+    # ═══════════════════════════════════════════════════════════════
+    HEADERS = ['Nr.', 'Ref.', 'Issue / Änderung', f'Position {client_party}',
+               'Position Gegenseite', 'Kommentare / Handlungsempfehlung']
+
+    total_tbc = 0  # count TBC/TBD occurrences
+
     for section in issue_list.get('sections', []):
         sec_num = section.get('number', '')
         sec_title = section.get('title', '')
-        doc.add_heading(f'{sec_num}. {sec_title}', level=1)
-
-        if section.get('summary'):
-            p = doc.add_paragraph()
-            r = p.add_run(section['summary'])
-            r.font.size = Pt(9)
-            r.font.italic = True
-            r.font.color.rgb = RGBColor(80, 80, 80)
-
         issues = section.get('issues', [])
         if not issues:
             continue
 
-        # Create table: Ref | Issue/Change | Version A | Version B | Kommentar
-        cols = 5
-        tbl = doc.add_table(rows=1 + len(issues), cols=cols)
-        tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+        # Section number for SEQ field namespace
+        sec_idx = section.get('number', 'I')
+        # Use numeric index for SEQ
+        roman_to_num = {'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5,
+                        'VI': 6, 'VII': 7, 'VIII': 8, 'IX': 9, 'X': 10,
+                        'XI': 11, 'XII': 12, 'XIII': 13, 'XIV': 14, 'XV': 15}
+        sec_num_int = roman_to_num.get(sec_idx, 1)
 
-        # Header row
-        headers = ['Ref.', 'Issue / Change', 'Version A\n(Alt)', 'Version B\n(Neu)', 'Kommentar']
-        for i, h in enumerate(headers):
-            cell = tbl.cell(0, i)
-            set_cell_bg(cell, HEADER_BG)
-            add_cell_text(cell, h, bold=True, size=8, color=HEADER_TEXT)
+        # Create table: 1 header + 1 section-header + N issues
+        num_rows = 2 + len(issues)
+        tbl = doc.add_table(rows=num_rows, cols=6)
+        tbl.alignment = WD_TABLE_ALIGNMENT.LEFT
+        tbl.autofit = False
+
+        # Set preferred table width to full page
+        tbl_pr = tbl._element.find(qn('w:tblPr'))
+        if tbl_pr is None:
+            tbl_pr = OxmlElement('w:tblPr')
+            tbl._element.insert(0, tbl_pr)
+        tbl_w = OxmlElement('w:tblW')
+        tbl_w.set(qn('w:w'), str(sum(COL_WIDTHS_DXA)))
+        tbl_w.set(qn('w:type'), 'dxa')
+        tbl_pr.append(tbl_w)
+
+        # Row 0: column headers
+        make_header_row(tbl, 0, HEADERS)
+
+        # Row 1: section header (merged)
+        make_section_header_row(tbl, 1, f'{sec_idx}. {sec_title}')
 
         # Data rows
-        for row_idx, issue in enumerate(issues, 1):
-            severity = issue.get('severity', 'NEUTRAL').upper()
-            sev_bg = SEVERITY_BG.get(severity, 'F5F5F5')
-            sev_color = SEVERITY_COLORS.get(severity, RGBColor(100, 100, 100))
+        for row_offset, issue in enumerate(issues):
+            row_idx = 2 + row_offset
+            severity = issue.get('severity', 'REDAKTIONELL').upper()
+            row_bg = SEVERITY_ROW_BG.get(severity, WHITE_BG)
 
-            # Ref cell with severity background
-            ref_cell = tbl.cell(row_idx, 0)
-            set_cell_bg(ref_cell, sev_bg)
+            # Apply bg to all cells in row
+            for col_idx in range(6):
+                cell = tbl.cell(row_idx, col_idx)
+                set_cell_bg(cell, row_bg)
+                set_cell_width(cell, COL_WIDTHS_DXA[col_idx])
+
+            # Col 0: Nr. (SEQ field)
+            nr_cell = tbl.cell(row_idx, 0)
+            p = nr_cell.paragraphs[0]
+            p.paragraph_format.space_before = Pt(1)
+            p.paragraph_format.space_after = Pt(1)
+            add_seq_field(p, sec_num_int)
+
+            # Col 1: Ref.
+            ref_cell = tbl.cell(row_idx, 1)
             p = ref_cell.paragraphs[0]
-            r = p.add_run(issue.get('ref', ''))
+            p.paragraph_format.space_before = Pt(1)
+            p.paragraph_format.space_after = Pt(1)
+            label = issue.get('label', issue.get('ref', ''))
+            r = p.add_run(label)
             r.font.size = Pt(8)
+            r.font.name = 'Calibri'
             r.bold = True
-            p.add_run('\n')
-            label_txt = issue.get('label', '')
-            if label_txt:
-                r2 = p.add_run(label_txt)
-                r2.font.size = Pt(7)
-                r2.bold = True
 
-            # Issue cell
-            issue_cell = tbl.cell(row_idx, 1)
+            # Col 2: Issue / Change
+            issue_cell = tbl.cell(row_idx, 2)
             p = issue_cell.paragraphs[0]
+            p.paragraph_format.space_before = Pt(1)
+            p.paragraph_format.space_after = Pt(1)
             # Severity badge
-            sev_run = p.add_run(f'[{severity}] ')
-            sev_run.font.size = Pt(7)
-            sev_run.bold = True
-            sev_run.font.color.rgb = sev_color
+            badge_colors = {
+                'KRITISCH': RGBColor(180, 20, 20),
+                'BEDEUTEND': RGBColor(180, 120, 0),
+                'REDAKTIONELL': RGBColor(120, 120, 120),
+            }
+            badge_r = p.add_run(f'[{severity}] ')
+            badge_r.font.size = Pt(7)
+            badge_r.bold = True
+            badge_r.font.name = 'Calibri'
+            badge_r.font.color.rgb = badge_colors.get(severity, RGBColor(100, 100, 100))
             # Issue text
-            issue_run = p.add_run(issue.get('issue', ''))
-            issue_run.font.size = Pt(8)
-            # Recommendation
-            rec = issue.get('recommendation', '')
-            if rec:
-                p.add_run('\n')
-                rec_run = p.add_run(f'Empfehlung: {rec}')
-                rec_run.font.size = Pt(7)
-                rec_run.bold = True
-                rec_run.font.color.rgb = sev_color
+            issue_r = p.add_run(issue.get('issue', ''))
+            issue_r.font.size = Pt(8)
+            issue_r.font.name = 'Calibri'
 
-            # Old text
-            old_cell = tbl.cell(row_idx, 2)
-            add_cell_text(old_cell, issue.get('old_text', ''), size=7)
+            # Col 3: Position Partei A (beauftragende Partei)
+            pa_cell = tbl.cell(row_idx, 3)
+            pa_text = issue.get('party_a', issue.get('sell_side', issue.get('old_text', '')))
+            add_cell_text(pa_cell, pa_text, size=8)
 
-            # New text
-            new_cell = tbl.cell(row_idx, 3)
-            add_cell_text(new_cell, issue.get('new_text', ''), size=7)
+            # Col 4: Position Partei B (Gegenseite)
+            pb_cell = tbl.cell(row_idx, 4)
+            pb_text = issue.get('party_b', issue.get('buy_side', issue.get('new_text', '')))
+            add_cell_text(pb_cell, pb_text, size=8)
 
-            # Comment
-            comment_cell = tbl.cell(row_idx, 4)
-            add_cell_text(comment_cell, issue.get('comment', ''), size=7)
+            # Col 5: Kommentare M56
+            comment_cell = tbl.cell(row_idx, 5)
+            comment_text = issue.get('comment', '')
+            add_cell_text(comment_cell, comment_text, size=8)
 
-        # Set column widths
-        for row in tbl.rows:
-            row.cells[0].width = Cm(2.0)
-            row.cells[1].width = Cm(6.0)
-            row.cells[2].width = Cm(3.5)
-            row.cells[3].width = Cm(3.5)
-            row.cells[4].width = Cm(3.5)
+            # Count TBC/TBD
+            if 'TBC' in comment_text.upper() or 'TBD' in comment_text.upper():
+                total_tbc += 1
 
-        doc.add_paragraph()  # spacer
+        doc.add_paragraph()  # spacer between sections
+
+    # ═══════════════════════════════════════════════════════════════
+    # SUMMARY TABLE (last section)
+    # ═══════════════════════════════════════════════════════════════
+    sections_data = issue_list.get('sections', [])
+    if sections_data:
+        h = doc.add_paragraph()
+        hr = h.add_run('SUMMARY / ÜBERSICHT')
+        hr.font.size = Pt(11)
+        hr.font.name = 'Calibri'
+        hr.bold = True
+        hr.font.color.rgb = DARK_BLUE_RGB
+
+        sum_tbl = doc.add_table(rows=1, cols=4)
+        sum_tbl.alignment = WD_TABLE_ALIGNMENT.LEFT
+        sum_headers = ['Priorität', 'Sektion', 'Anzahl Issues', 'Offene Punkte (TBC/TBD)']
+        for i, sh in enumerate(sum_headers):
+            cell = sum_tbl.cell(0, i)
+            set_cell_bg(cell, DARK_BLUE)
+            add_cell_text(cell, sh, bold=True, size=8, color=WHITE_RGB)
+
+        grand_total = 0
+        for sec in sections_data:
+            issues = sec.get('issues', [])
+            if not issues:
+                continue
+            # Count severities in this section
+            sev_counts = {'KRITISCH': 0, 'BEDEUTEND': 0, 'REDAKTIONELL': 0}
+            sec_tbc = 0
+            for iss in issues:
+                sev = iss.get('severity', 'REDAKTIONELL').upper()
+                if sev in sev_counts:
+                    sev_counts[sev] += 1
+                else:
+                    sev_counts['REDAKTIONELL'] += 1
+                c = iss.get('comment', '')
+                if 'TBC' in c.upper() or 'TBD' in c.upper():
+                    sec_tbc += 1
+
+            # Determine dominant priority
+            if sev_counts['KRITISCH'] > 0:
+                prio_label = 'KRITISCH'
+                prio_bg = RED_BG
+            elif sev_counts['BEDEUTEND'] > 0:
+                prio_label = 'BEDEUTEND'
+                prio_bg = YELLOW_BG
+            else:
+                prio_label = 'REDAKTIONELL'
+                prio_bg = WHITE_BG
+
+            row = sum_tbl.add_row()
+            prio_cell = row.cells[0]
+            set_cell_bg(prio_cell, prio_bg)
+            add_cell_text(prio_cell, prio_label, bold=True, size=8)
+
+            add_cell_text(row.cells[1],
+                          f"{sec.get('number', '')}. {sec.get('title', '')}",
+                          size=8)
+            add_cell_text(row.cells[2], str(len(issues)), size=8,
+                          alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            add_cell_text(row.cells[3], str(sec_tbc) if sec_tbc else '—', size=8,
+                          alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            grand_total += len(issues)
+
+        # Total row
+        tot_row = sum_tbl.add_row()
+        set_cell_bg(tot_row.cells[0], DARK_BLUE)
+        add_cell_text(tot_row.cells[0], '', size=8)
+        set_cell_bg(tot_row.cells[1], DARK_BLUE)
+        add_cell_text(tot_row.cells[1], 'GESAMT', bold=True, size=9, color=WHITE_RGB)
+        set_cell_bg(tot_row.cells[2], DARK_BLUE)
+        add_cell_text(tot_row.cells[2], str(grand_total), bold=True, size=9,
+                      color=WHITE_RGB, alignment=WD_ALIGN_PARAGRAPH.CENTER)
+        set_cell_bg(tot_row.cells[3], DARK_BLUE)
+        add_cell_text(tot_row.cells[3], str(total_tbc) if total_tbc else '—',
+                      bold=True, size=9, color=WHITE_RGB,
+                      alignment=WD_ALIGN_PARAGRAPH.CENTER)
 
     # ── Footer ──
     doc.add_paragraph()
     footer = doc.add_paragraph()
     r = footer.add_run('Erstellt mit MyCompare AI — Automatische Analyse, keine Rechtsberatung.')
-    r.font.size = Pt(8)
+    r.font.size = Pt(7)
     r.font.color.rgb = RGBColor(160, 160, 160)
+    r.font.name = 'Calibri'
     r.italic = True
+
+    # Set document metadata
+    doc.core_properties.author = client_party
+    doc.core_properties.last_modified_by = client_party
+    doc.core_properties.language = 'de-DE'
 
     tmpfile = tempfile.NamedTemporaryFile(suffix='.docx', delete=False)
     doc.save(tmpfile.name)

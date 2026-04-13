@@ -357,11 +357,60 @@ def _extract_para_images(para_element, doc_part):
     return image_names
 
 
+def _accept_tracked_changes(doc_element):
+    """Accept all tracked changes in a DOCX document element in-place.
+
+    This treats the document as if all revisions were accepted:
+    - w:ins (insertions): unwrap — keep the child runs, remove the w:ins wrapper
+    - w:del (deletions): remove entirely — deleted text is discarded
+    - w:moveTo: unwrap (keep content, treat as inserted at new position)
+    - w:moveFrom: remove entirely (old position no longer relevant)
+    - w:rPrChange, w:pPrChange, w:sectPrChange, w:tblPrChange, etc.: remove
+      (formatting revision markers)
+
+    Must be called BEFORE python-docx iterates paragraphs/runs, since python-docx
+    only sees direct w:r children of w:p (not those wrapped in w:ins).
+    """
+    from lxml import etree
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    # 1. Remove all w:del and w:moveFrom elements (deleted / moved-away text)
+    for tag_name in ('del', 'moveFrom'):
+        for el in doc_element.findall(f'.//{{{W}}}{tag_name}'):
+            parent = el.getparent()
+            if parent is not None:
+                parent.remove(el)
+
+    # 2. Unwrap all w:ins and w:moveTo elements (keep children, remove wrapper)
+    for tag_name in ('ins', 'moveTo'):
+        for el in doc_element.findall(f'.//{{{W}}}{tag_name}'):
+            parent = el.getparent()
+            if parent is not None:
+                idx = list(parent).index(el)
+                for child in list(el):
+                    el.remove(child)
+                    parent.insert(idx, child)
+                    idx += 1
+                parent.remove(el)
+
+    # 3. Remove revision property change markers (they only record what changed)
+    for tag_name in ('rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange',
+                      'tcPrChange', 'trPrChange', 'tblGridChange'):
+        for el in doc_element.findall(f'.//{{{W}}}{tag_name}'):
+            parent = el.getparent()
+            if parent is not None:
+                parent.remove(el)
+
+
 def extract_docx(filepath):
     """Extract text with formatting, fields, numbering, cross-refs, TOC, comments,
     footnotes, endnotes, XE/TA/TC index entries, and embedded images from DOCX files."""
     from docx import Document
     doc = Document(filepath)
+
+    # Accept all tracked changes so the comparison sees the final text
+    _accept_tracked_changes(doc.element)
+
     paragraphs = []
     plain_parts = []
 
