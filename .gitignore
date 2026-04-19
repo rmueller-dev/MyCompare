@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+storage/
+frontend/node_modules/
+frontend/build/
+.env
+.api_config.json
+.claude/
+electron/node_modules/
+electron/dist/
+electron/icon.iconset/
+electron/icon.icns
+electron/icon.png
