@@ -8,7 +8,9 @@ from .models import SessionLocal, Document, Version, RenderingSet, Folder, STORA
 from .extractors import extract
 from .diff_engine import compute_diff
 from .image_diff import extract_images, compare_images
-from .ai_analysis import analyze_changes, _check_ollama, get_providers_status, set_api_key, get_api_key
+from .ai_analysis import (analyze_changes, _check_ollama, get_providers_status,
+                           set_api_key, get_api_key,
+                           get_ai_user_profile, set_ai_user_profile)
 
 # ── In-memory job store for async AI analysis ──
 _ai_jobs = {}  # job_id -> {status, progress, result, error}
@@ -3702,6 +3704,21 @@ def ai_get_api_key():
         'has_key': bool(key),
         'key_preview': f"{key[:10]}...{key[-4:]}" if key and len(key) > 14 else '',
     })
+
+
+@api.route('/ai/user-profile', methods=['GET'])
+def ai_get_user_profile():
+    """Return the stored AI user profile text."""
+    return jsonify({'profile': get_ai_user_profile()})
+
+
+@api.route('/ai/user-profile', methods=['POST'])
+def ai_set_user_profile():
+    """Update the AI user profile text."""
+    data = request.get_json() or {}
+    profile = data.get('profile', '').strip()
+    set_ai_user_profile(profile)
+    return jsonify({'status': 'ok', 'message': 'Profil gespeichert'})
 
 
 def _run_ai_job(job_id, analysis_changes, client_party, document_context,

@@ -91,6 +91,10 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
   const [claudeKeyPreview, setClaudeKeyPreview] = useState('');
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showApiKeyInput, setShowApiKeyInput] = useState(false);
+  const [userProfile, setUserProfile] = useState('');
+  const [showProfileEditor, setShowProfileEditor] = useState(false);
+  const [profileInput, setProfileInput] = useState('');
+  const [profileSaved, setProfileSaved] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [elapsed, setElapsed] = useState(0);
@@ -133,7 +137,31 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
         if (data.has_key) setClaudeAvailable(true);
       })
       .catch(() => {});
+
+    fetch(`${API}/ai/user-profile`)
+      .then(r => r.json())
+      .then(data => setUserProfile(data.profile || ''))
+      .catch(() => {});
   }, []);
+
+  const handleSaveProfile = async () => {
+    try {
+      const resp = await fetch(`${API}/ai/user-profile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile: profileInput }),
+      });
+      const data = await resp.json();
+      if (data.status === 'ok') {
+        setUserProfile(profileInput);
+        setShowProfileEditor(false);
+        setProfileSaved(true);
+        setTimeout(() => setProfileSaved(false), 3000);
+      }
+    } catch (e) {
+      alert('Fehler: ' + e.message);
+    }
+  };
 
   const handleSaveApiKey = async () => {
     if (!apiKeyInput.trim()) return;
@@ -351,6 +379,41 @@ export default function AiAnalysis({ docId, docName, changeCount, versionA, vers
                   )}
                 </div>
               )}
+
+              {/* AI User Profile */}
+              <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs font-semibold text-gray-700">Nutzerprofil (AI-Systemanweisung)</span>
+                  <div className="flex items-center gap-2">
+                    {profileSaved && <span className="text-xs text-green-600 font-medium">Gespeichert</span>}
+                    {!showProfileEditor && (
+                      <button onClick={() => { setProfileInput(userProfile); setShowProfileEditor(true); }}
+                        className="text-xs text-blue-600 hover:text-blue-800 underline">
+                        {userProfile ? 'Bearbeiten' : 'Einrichten'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {!showProfileEditor && userProfile && (
+                  <p className="text-[11px] text-gray-500 line-clamp-2">{userProfile.substring(0, 120)}…</p>
+                )}
+                {!showProfileEditor && !userProfile && (
+                  <p className="text-[11px] text-gray-400 italic">Kein Profil hinterlegt — AI verwendet Standard-Systemanweisung.</p>
+                )}
+                {showProfileEditor && (
+                  <div className="mt-2 space-y-2">
+                    <textarea rows={5} value={profileInput} onChange={e => setProfileInput(e.target.value)}
+                      placeholder="Beschreiben Sie Ihre Rolle, bevorzugte Sprache, Detailtiefe, Zitierstil…"
+                      className="w-full border border-gray-300 rounded px-2 py-1.5 text-xs focus:ring-2 focus:ring-blue-500 resize-y" />
+                    <div className="flex gap-2">
+                      <button onClick={handleSaveProfile}
+                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium">Speichern</button>
+                      <button onClick={() => setShowProfileEditor(false)}
+                        className="px-2 py-1.5 text-gray-600 hover:text-gray-800 text-xs">Abbrechen</button>
+                    </div>
+                  </div>
+                )}
+              </div>
 
               {/* Ollama warning */}
               {provider === 'ollama' && ollamaAvailable === false && (

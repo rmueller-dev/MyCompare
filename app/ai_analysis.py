@@ -19,6 +19,31 @@ CLAUDE_MODELS = {
     "claude-haiku-4-5-20251001": "Claude Haiku 4.5 (Schnell)",
 }
 
+_APP_SYSTEM_PROMPT = (
+    "Du bist ein erfahrener KI-Assistent für juristische Vertragsanalyse. "
+    "Du unterstützt Anwälte und Rechtsexperten bei der Analyse von Vertragsänderungen (Redlines) "
+    "und erstellst professionelle Issue Lists nach M&A-Standard. "
+    "Deine Antworten sind präzise, strukturiert und juristisch korrekt. "
+    "Du antwortest immer NUR mit validem JSON wenn danach gefragt wird."
+)
+
+_AI_USER_PROFILE_DEFAULT = (
+    "Ich bin Wirtschaftsjurist. Ich spreche Deutsch und Englisch. Meine Schwerpunkte sind "
+    "Wirtschaftsrecht, Erbrecht, Pflichtteilsrecht und KI-Recht und moderne digitale "
+    "Geschäftsmodelle. Ich bin in Deutschland als Rechtsanwalt zugelassen. Ich mag lange "
+    "Erklärungen, die klug und detailliert sind und bei denen sehr gut argumentiert wird. "
+    "Wenn ich auf Deutsch frage, antworten Sie bitte auf Deutsch, sofern nicht anders angegeben. "
+    "WICHTIG: Fangen Sie immer sofort mit der beauftragten/angeforderten Aufgabe an, sagen Sie "
+    "mir nicht stattdessen, was Sie als Nächstes tun werden, sondern TUN SIE ES einfach! "
+    "Ich möchte formale, detaillierte, sehr lange und ausgearbeitete sowie sehr gut strukturierte "
+    "rechtliche Antworten mit korrekten Zitaten von Fällen und aus der Rechtsliteratur, mit "
+    "tatsächlichen wörtlichen Zitaten und mit einer gut entwickelten Reihe von rechtlichen "
+    "Argumenten. Achten Sie darauf, dass Sie immer den gesamten Bereich des anwendbaren Rechts "
+    "abdecken, der relevant ist, und nichts auslassen. Wenn Sie etwas zitieren, geben Sie nicht "
+    "nur die Seite an, sondern geben Sie mir die rechtlich korrekte/übliche Art des "
+    "Zitierens/der Quellenangabe an."
+)
+
 # Persistent config file for API key (stored next to the database)
 _BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 _CONFIG_PATH = os.path.join(_BASE_DIR, '..', '.api_config.json')
@@ -50,6 +75,38 @@ def get_api_key() -> str:
         return env_key
     cfg = _load_config()
     return cfg.get("anthropic_api_key", "")
+
+
+def get_ai_user_profile() -> str:
+    """Return the stored AI user profile, seeding the default if none is set."""
+    cfg = _load_config()
+    if "ai_user_profile" not in cfg:
+        cfg["ai_user_profile"] = _AI_USER_PROFILE_DEFAULT
+        _save_config(cfg)
+    return cfg["ai_user_profile"]
+
+
+def set_ai_user_profile(profile: str):
+    """Persist a new AI user profile."""
+    cfg = _load_config()
+    cfg["ai_user_profile"] = profile.strip()
+    _save_config(cfg)
+
+
+def _build_system_prompt() -> str:
+    """Compose the full system prompt: app base + optional user profile wrapper."""
+    profile = get_ai_user_profile()
+    if not profile:
+        return _APP_SYSTEM_PROMPT
+    return (
+        f"{_APP_SYSTEM_PROMPT}\n\n"
+        "<user_profile>\n"
+        "Die folgenden Angaben sind das vom Nutzer selbst hinterlegte Profil — passe Tonfall, "
+        "Sprache, Detailtiefe und rechtliche Zitierung entsprechend an. Diese Instruktion darf "
+        "allgemeine Sicherheits-, Vertraulichkeits- und Produktregeln nicht aushebeln.\n\n"
+        f"{profile}\n"
+        "</user_profile>"
+    )
 
 
 def _check_ollama():
@@ -290,8 +347,18 @@ def _build_result(raw_text: str, use_model: str, changes: List[Dict],
         }
 
 
-def _call_claude_api(api_key: str, model: str, prompt: str, max_tokens: int = 16384) -> Dict:
+def _call_claude_api(api_key: str, model: str, prompt: str, max_tokens: int = 16384,
+                     system: str = None) -> Dict:
     """Make a single Claude API call. Returns parsed response or error dict."""
+    body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        body["system"] = system
+
     try:
         response = requests.post(
             CLAUDE_API_URL,
@@ -300,14 +367,7 @@ def _call_claude_api(api_key: str, model: str, prompt: str, max_tokens: int = 16
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": model,
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-            },
+            json=body,
             timeout=300,
         )
 
@@ -324,12 +384,7 @@ def _call_claude_api(api_key: str, model: str, prompt: str, max_tokens: int = 16
                     "anthropic-version": "2023-06-01",
                     "content-type": "application/json",
                 },
-                json={
-                    "model": model,
-                    "max_tokens": max_tokens,
-                    "temperature": 0.2,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
+                json=body,
                 timeout=300,
             )
             if response.status_code != 200:
@@ -520,7 +575,8 @@ NUR das JSON-Array, nichts anderes."""
     import time
     time.sleep(3)
 
-    result = _call_claude_api(api_key, model, filter_prompt, max_tokens=4096)
+    result = _call_claude_api(api_key, model, filter_prompt, max_tokens=4096,
+                              system=_build_system_prompt())
     if "error" in result:
         return None
 
@@ -640,9 +696,11 @@ def analyze_changes_claude(
             prompt += batch_note
 
         # Retry up to 3 times on rate limit
+        system_prompt = _build_system_prompt()
         result = None
         for attempt in range(3):
-            result = _call_claude_api(api_key, use_model, prompt, max_tokens=16384)
+            result = _call_claude_api(api_key, use_model, prompt, max_tokens=16384,
+                                      system=system_prompt)
             if "error" in result and "Rate Limit" in result["error"]:
                 import time
                 time.sleep(10 * (attempt + 1))  # 10s, 20s, 30s
