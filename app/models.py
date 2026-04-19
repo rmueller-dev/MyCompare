@@ -5,8 +5,9 @@ import os
 import json
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB_PATH = os.path.join(BASE_DIR, '..', 'mycompare.db')
-STORAGE_DIR = os.path.join(BASE_DIR, '..', 'storage')
+_DATA_DIR = os.environ.get('MYCOMPARE_DATA_DIR') or os.path.abspath(os.path.join(BASE_DIR, '..'))
+DB_PATH = os.path.join(_DATA_DIR, 'mycompare.db')
+STORAGE_DIR = os.path.join(_DATA_DIR, 'storage')
 
 engine = create_engine(f'sqlite:///{DB_PATH}', echo=False)
 SessionLocal = sessionmaker(bind=engine)

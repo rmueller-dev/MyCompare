@@ -19,7 +19,7 @@ def create_app():
         init_db()
 
     # Serve React frontend
-    frontend_dir = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'build')
+    frontend_dir = os.environ.get('FRONTEND_DIR') or os.path.join(os.path.dirname(__file__), '..', 'frontend', 'build')
 
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
