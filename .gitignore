@@ -13,3 +13,6 @@ electron/dist/
 electron/icon.iconset/
 electron/icon.icns
 electron/icon.png
+dist/
+build/
+*.spec

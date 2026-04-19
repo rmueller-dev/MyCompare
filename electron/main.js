@@ -3,14 +3,27 @@ const path = require('path');
 const { spawn } = require('child_process');
 const http = require('http');
 const net = require('net');
+const fs = require('fs');
 
-// Keep references to prevent garbage collection
 let mainWindow = null;
 let backendProcess = null;
 let serverPort = null;
 
-// Path to the project root (one level up from electron/)
+const IS_PACKAGED = app.isPackaged;
 const PROJECT_ROOT = path.join(__dirname, '..');
+
+// Single-instance lock: focus existing window instead of opening a second one
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Find a free port
@@ -59,42 +72,65 @@ function waitForServer(port, retries = 60, delay = 500) {
 }
 
 // ---------------------------------------------------------------------------
-// Start the Flask/gunicorn backend
+// Start the backend (PyInstaller binary in production, gunicorn in dev)
 // ---------------------------------------------------------------------------
 async function startBackend() {
   serverPort = await findFreePort();
 
-  const venvPython = path.join(PROJECT_ROOT, 'venv', 'bin', 'python');
-  const gunicorn = path.join(PROJECT_ROOT, 'venv', 'bin', 'gunicorn');
+  let backendCmd, backendArgs, backendEnv, backendCwd;
 
-  // Check if venv exists
-  const fs = require('fs');
-  if (!fs.existsSync(venvPython)) {
-    dialog.showErrorBox(
-      'MyCompare — Fehler',
-      'Python Virtual Environment nicht gefunden.\n\n' +
-      'Bitte zuerst im Terminal ausführen:\n' +
-      `cd "${PROJECT_ROOT}" && bash start.sh\n\n` +
-      'Danach die App erneut starten.'
-    );
-    app.quit();
-    return;
-  }
+  if (IS_PACKAGED) {
+    const userData = app.getPath('userData');
+    const frontendDir = path.join(process.resourcesPath, 'frontend', 'build');
 
-  // Start gunicorn
-  backendProcess = spawn(gunicorn, [
-    '--bind', `127.0.0.1:${serverPort}`,
-    '--workers', '2',
-    '--timeout', '3600',
-    '--access-logfile', '-',
-    'app.main:create_app()',
-  ], {
-    cwd: PROJECT_ROOT,
-    env: {
+    if (!fs.existsSync(userData)) {
+      fs.mkdirSync(userData, { recursive: true });
+    }
+
+    backendCmd = path.join(process.resourcesPath, 'mycompare-backend', 'mycompare-backend');
+    backendArgs = ['--port', String(serverPort)];
+    backendCwd = userData;
+    backendEnv = {
+      ...process.env,
+      FRONTEND_DIR: frontendDir,
+      MYCOMPARE_DATA_DIR: userData,
+    };
+  } else {
+    // Development: use gunicorn from venv
+    const venvPython = path.join(PROJECT_ROOT, 'venv', 'bin', 'python');
+    const gunicorn = path.join(PROJECT_ROOT, 'venv', 'bin', 'gunicorn');
+
+    if (!fs.existsSync(venvPython)) {
+      dialog.showErrorBox(
+        'MyCompare — Fehler',
+        'Python Virtual Environment nicht gefunden.\n\n' +
+        'Bitte zuerst im Terminal ausführen:\n' +
+        `cd "${PROJECT_ROOT}" && bash start.sh\n\n` +
+        'Danach die App erneut starten.'
+      );
+      app.quit();
+      return;
+    }
+
+    backendCmd = gunicorn;
+    backendArgs = [
+      '--bind', `127.0.0.1:${serverPort}`,
+      '--workers', '2',
+      '--timeout', '3600',
+      '--access-logfile', '-',
+      'app.main:create_app()',
+    ];
+    backendCwd = PROJECT_ROOT;
+    backendEnv = {
       ...process.env,
       PATH: path.join(PROJECT_ROOT, 'venv', 'bin') + ':' + process.env.PATH,
       VIRTUAL_ENV: path.join(PROJECT_ROOT, 'venv'),
-    },
+    };
+  }
+
+  backendProcess = spawn(backendCmd, backendArgs, {
+    cwd: backendCwd,
+    env: backendEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -120,7 +156,6 @@ async function startBackend() {
     backendProcess = null;
   });
 
-  // Wait for the server to be ready
   await waitForServer(serverPort);
 }
 
@@ -131,7 +166,6 @@ function stopBackend() {
   if (backendProcess) {
     console.log('Stopping backend...');
     backendProcess.kill('SIGTERM');
-    // Force kill after 5 seconds
     setTimeout(() => {
       if (backendProcess) {
         backendProcess.kill('SIGKILL');
@@ -170,7 +204,6 @@ function createWindow() {
     mainWindow = null;
   });
 
-  // Open external links in default browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: 'deny' };
@@ -178,7 +211,7 @@ function createWindow() {
 }
 
 // ---------------------------------------------------------------------------
-// macOS application menu
+// macOS application menu (vollständig lokalisiert)
 // ---------------------------------------------------------------------------
 function createMenu() {
   const template = [
@@ -237,6 +270,13 @@ function createMenu() {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.on('ready', async () => {
+  app.setAboutPanelOptions({
+    applicationName: 'MyCompare',
+    applicationVersion: app.getVersion(),
+    credits: 'Dr. Raoul Müller — Indemnis',
+    copyright: '© 2025 Indemnis',
+  });
+
   createMenu();
 
   try {
@@ -245,9 +285,8 @@ app.on('ready', async () => {
   } catch (err) {
     dialog.showErrorBox(
       'MyCompare — Fehler',
-      `Server konnte nicht gestartet werden:\n${err.message}\n\n` +
-      'Bitte stelle sicher, dass alle Abhängigkeiten installiert sind:\n' +
-      `cd "${PROJECT_ROOT}" && bash start.sh`
+      `Server konnte nicht gestartet werden:\n${err.message}` +
+      (IS_PACKAGED ? '' : `\n\nBitte stelle sicher, dass alle Abhängigkeiten installiert sind:\ncd "${PROJECT_ROOT}" && bash start.sh`)
     );
     app.quit();
   }

@@ -46,7 +46,8 @@ _AI_USER_PROFILE_DEFAULT = (
 
 # Persistent config file for API key (stored next to the database)
 _BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-_CONFIG_PATH = os.path.join(_BASE_DIR, '..', '.api_config.json')
+_DATA_DIR = os.environ.get('MYCOMPARE_DATA_DIR') or os.path.abspath(os.path.join(_BASE_DIR, '..'))
+_CONFIG_PATH = os.path.join(_DATA_DIR, '.api_config.json')
 
 
 def _load_config() -> dict:

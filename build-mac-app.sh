@@ -11,18 +11,18 @@ echo ""
 
 # 1. Ensure Python venv exists
 if [ ! -d "venv" ]; then
-    echo "[1/5] Erstelle Python Virtual Environment..."
+    echo "[1/6] Erstelle Python Virtual Environment..."
     python3 -m venv venv
 else
-    echo "[1/5] Virtual Environment vorhanden."
+    echo "[1/6] Virtual Environment vorhanden."
 fi
 
 source venv/bin/activate
-echo "[2/5] Installiere Python-Abhängigkeiten..."
+echo "[2/6] Installiere Python-Abhängigkeiten..."
 pip install -q -r requirements.txt
 
 # 2. Build React frontend
-echo "[3/5] Baue React-Frontend..."
+echo "[3/6] Baue React-Frontend..."
 cd frontend
 if [ ! -d "node_modules" ]; then
     npm install
@@ -30,15 +30,19 @@ fi
 npm run build 2>&1 | tail -3
 cd "$SCRIPT_DIR"
 
-# 3. Generate icon (if not already done)
-echo "[4/5] Erstelle App-Icon..."
+# 3. Build Python backend with PyInstaller
+echo "[4/6] Baue Python-Backend (PyInstaller)..."
+bash electron/build-python.sh
+
+# 4. Generate icon (if not already done)
+echo "[5/6] Erstelle App-Icon..."
 cd electron
 if [ ! -f "icon.icns" ]; then
     bash generate-icon.sh 2>/dev/null || echo "  Icon-Generierung übersprungen (kann später auf macOS erstellt werden)"
 fi
 
-# 4. Install Electron deps & build
-echo "[5/5] Baue Electron App..."
+# 5. Install Electron deps & build
+echo "[6/6] Baue Electron App..."
 if [ ! -d "node_modules" ]; then
     npm install
 fi
@@ -53,6 +57,12 @@ echo "  Fertig! Die App liegt in:"
 echo "  electron/dist/"
 echo "========================================="
 echo ""
-echo "  Zum Installieren: .dmg Datei öffnen und"
-echo "  MyCompare.app nach /Applications ziehen."
+echo "  Zum Installieren:"
+echo "  1. electron/dist/MyCompare-*.dmg öffnen"
+echo "  2. MyCompare.app nach /Applications ziehen"
+echo "  3. Beim ersten Start: Rechtsklick → Öffnen"
+echo "     (umgeht Gatekeeper für unsignierte Apps)"
+echo ""
+echo "  Daten werden gespeichert in:"
+echo "  ~/Library/Application Support/MyCompare/"
 echo ""

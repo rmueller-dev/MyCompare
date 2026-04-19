@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "MyCompare — Dokumentenvergleich für Juristen",
   "main": "main.js",
-  "author": "MyCompare",
+  "author": "Indemnis",
   "license": "UNLICENSED",
   "private": true,
   "scripts": {
@@ -17,40 +17,32 @@
     "electron-builder": "^25.1.0"
   },
   "build": {
-    "appId": "com.mycompare.app",
+    "appId": "de.indemnis.mycompare",
     "productName": "MyCompare",
     "directories": {
       "output": "dist"
     },
     "mac": {
-      "category": "public.app-category.business",
+      "category": "public.app-category.productivity",
       "icon": "icon.icns",
       "target": [
         {
           "target": "dmg",
-          "arch": ["universal"]
+          "arch": ["arm64", "x64"]
         }
       ],
       "hardenedRuntime": false
     },
     "extraResources": [
       {
-        "from": "../app",
-        "to": "app",
-        "filter": ["**/*", "!__pycache__/**"]
-      },
-      {
         "from": "../frontend/build",
         "to": "frontend/build",
         "filter": ["**/*"]
       },
       {
-        "from": "../requirements.txt",
-        "to": "requirements.txt"
-      },
-      {
-        "from": "../start.sh",
-        "to": "start.sh"
+        "from": "../dist/mycompare-backend",
+        "to": "mycompare-backend",
+        "filter": ["**/*"]
       }
     ],
     "dmg": {
