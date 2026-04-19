@@ -67,9 +67,9 @@ def word_level_diff(old_text: str, new_text: str) -> List[Dict[str, Any]]:
     """
     Word-level diff for more granular change detection.
     Splits on whitespace boundaries while preserving whitespace.
+    Skips equal tokens (used for structural inline_diffs).
     """
     import re
-    # Split into tokens (words and whitespace)
     tokens_a = re.findall(r'\S+|\s+', old_text)
     tokens_b = re.findall(r'\S+|\s+', new_text)
 
@@ -87,6 +87,127 @@ def word_level_diff(old_text: str, new_text: str) -> List[Dict[str, Any]]:
         })
 
     return changes
+
+
+def word_level_diff_full(old_text: str, new_text: str) -> List[Dict[str, Any]]:
+    """
+    Word-level diff including equal tokens — required for inline redline rendering
+    where unchanged context must be shown around highlighted changes.
+    Used for unified_lines inline_diff (ThreePaneDiff + DiffLine middle pane).
+    """
+    import re
+    tokens_a = re.findall(r'\S+|\s+', old_text)
+    tokens_b = re.findall(r'\S+|\s+', new_text)
+
+    sm = difflib.SequenceMatcher(None, tokens_a, tokens_b, autojunk=False)
+    segments = []
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        segments.append({
+            'type': tag,
+            'old_tokens': tokens_a[i1:i2],
+            'new_tokens': tokens_b[j1:j2],
+        })
+
+    return segments
+
+
+def detect_moves(
+    unified_lines: List[Dict[str, Any]],
+    min_tokens: int = 5,
+    similarity_threshold: float = 0.85,
+) -> List[Dict[str, Any]]:
+    """
+    Post-processing pass: detect moved passages by matching delete+insert pairs.
+    Matching delete/insert pairs are reclassified as move_out/move_in with the
+    same moveId so the UI can link them (hover highlight, click-to-jump).
+
+    Litera/DeltaView-style: moves rendered in green, distinct from red deletions
+    and blue insertions.
+    """
+    import re
+    import hashlib
+
+    def _normalize(text: str) -> str:
+        return ' '.join(re.sub(r'[^\w\s]', '', text.lower()).split())
+
+    def _tokenize(text: str) -> List[str]:
+        return re.findall(r'\S+', text.lower())
+
+    deletes = [
+        (i, line) for i, line in enumerate(unified_lines)
+        if line['type'] == 'delete' and len(_tokenize(line.get('left_text', ''))) >= min_tokens
+    ]
+    inserts = [
+        (i, line) for i, line in enumerate(unified_lines)
+        if line['type'] == 'insert' and len(_tokenize(line.get('right_text', ''))) >= min_tokens
+    ]
+
+    if not deletes or not inserts:
+        return unified_lines
+
+    result = [dict(line) for line in unified_lines]
+    used_inserts: set = set()
+    move_id = 0
+
+    for del_idx, del_line in deletes:
+        del_text = del_line.get('left_text', '')
+        del_tokens = _tokenize(del_text)
+        del_norm = _normalize(del_text)
+        del_hash = hashlib.md5(del_norm.encode()).hexdigest()
+
+        best_match_ins_idx = None
+        best_ratio = 0.0
+
+        for ins_idx, ins_line in inserts:
+            if ins_idx in used_inserts:
+                continue
+
+            ins_text = ins_line.get('right_text', '')
+            ins_tokens = _tokenize(ins_text)
+            ins_norm = _normalize(ins_text)
+
+            # Pre-filter: skip if token counts differ by more than 25%
+            if del_tokens and ins_tokens:
+                count_ratio = min(len(del_tokens), len(ins_tokens)) / max(len(del_tokens), len(ins_tokens))
+                if count_ratio < 0.75:
+                    continue
+
+            # Fast path: exact normalized match
+            if del_norm == ins_norm:
+                ratio = 1.0
+            elif hashlib.md5(ins_norm.encode()).hexdigest() == del_hash:
+                ratio = 1.0
+            else:
+                ratio = difflib.SequenceMatcher(None, del_tokens, ins_tokens, autojunk=False).ratio()
+
+            if ratio >= similarity_threshold and ratio > best_ratio:
+                best_ratio = ratio
+                best_match_ins_idx = ins_idx
+
+        if best_match_ins_idx is not None:
+            move_id += 1
+            ins_line = unified_lines[best_match_ins_idx]
+            ins_text = ins_line.get('right_text', '')
+
+            # Inner diff only when there are small edits within the moved block
+            inner_diff = word_level_diff_full(del_text, ins_text) if best_ratio < 1.0 else []
+
+            result[del_idx] = {
+                **del_line,
+                'type': 'move_out',
+                'moveId': move_id,
+                'inner_diff': inner_diff,
+            }
+            result[best_match_ins_idx] = {
+                **ins_line,
+                'type': 'move_in',
+                'moveId': move_id,
+                'inner_diff': inner_diff,
+            }
+            used_inserts.add(best_match_ins_idx)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -612,9 +733,18 @@ def compute_diff(struct_a, text_a, struct_b, text_b, file_type, options=None):
                 right_idx = j1 + idx if (j1 + idx) < j2 else None
                 left_t = lines_a[left_idx] if left_idx is not None else ''
                 right_t = lines_b[right_idx] if right_idx is not None else ''
-                inline = word_level_diff(left_t, right_t) if left_t or right_t else []
+                # Classify precisely: only 'replace' when both sides have text
+                if left_idx is not None and right_idx is not None:
+                    entry_type = 'replace'
+                    inline = word_level_diff_full(left_t, right_t)
+                elif left_idx is not None:
+                    entry_type = 'delete'
+                    inline = []
+                else:
+                    entry_type = 'insert'
+                    inline = []
                 unified_lines.append({
-                    'type': 'replace',
+                    'type': entry_type,
                     'left_num': (left_idx + 1) if left_idx is not None else None,
                     'right_num': (right_idx + 1) if right_idx is not None else None,
                     'left_text': left_t,
@@ -646,11 +776,15 @@ def compute_diff(struct_a, text_a, struct_b, text_b, file_type, options=None):
                     'right_html': html_lines_b.get(idx, ''),
                 })
 
+    # Move detection: reclassify matching delete+insert pairs as move_out/move_in
+    unified_lines = detect_moves(unified_lines)
+
     # Count change types
     insert_count = sum(1 for c in structural_changes if c.get('type') == 'insert')
     delete_count = sum(1 for c in structural_changes if c.get('type') == 'delete')
     replace_count = sum(1 for c in structural_changes if c.get('type') == 'replace')
     formatting_count = sum(1 for c in structural_changes if c.get('type') == 'formatting')
+    move_count = sum(1 for line in unified_lines if line.get('type') == 'move_out')
 
     # Collect detailed format_changes list for formatting-only changes
     format_changes = []
@@ -694,6 +828,7 @@ def compute_diff(struct_a, text_a, struct_b, text_b, file_type, options=None):
             'delete_count': delete_count,
             'replace_count': replace_count,
             'formatting_count': formatting_count,
+            'move_count': move_count,
             'format_changes': format_changes,
             'total_lines_a': len(lines_a),
             'total_lines_b': len(lines_b),

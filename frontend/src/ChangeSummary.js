@@ -4,17 +4,19 @@ export default function ChangeSummary({ summary, colors }) {
   if (!summary) return null;
 
   const defaultColors = {
-    insert: '#16a34a',
+    insert: '#2563eb',
     delete: '#dc2626',
     replace: '#ca8a04',
     formatting: '#9333ea',
+    move: '#16a34a',
   };
   const c = { ...defaultColors, ...colors };
 
   const items = [
-    { label: 'Einfügungen', count: summary.insert_count || 0, color: c.insert, bg: '#f0fdf4' },
+    { label: 'Einfügungen', count: summary.insert_count || 0, color: c.insert, bg: '#eff6ff' },
     { label: 'Löschungen', count: summary.delete_count || 0, color: c.delete, bg: '#fef2f2' },
     { label: 'Ersetzungen', count: summary.replace_count || 0, color: c.replace, bg: '#fefce8' },
+    { label: 'Verschobene Passagen', count: summary.move_count || 0, color: c.move, bg: '#f0fdf4' },
     { label: 'Formatierung', count: summary.formatting_count || 0, color: c.formatting, bg: '#faf5ff' },
   ];
 

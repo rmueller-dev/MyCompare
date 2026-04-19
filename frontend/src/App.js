@@ -572,19 +572,30 @@ function DiffLine({ line, viewMode }) {
     replace: 'bg-yellow-50',
     delete: 'bg-red-50',
     insert: 'bg-green-50',
+    move_out: 'bg-green-50',
+    move_in: 'bg-green-50',
   };
 
   const showFormatted = viewMode === 'formatted';
+  const isMoveOut = line.type === 'move_out';
+  const isMoveIn = line.type === 'move_in';
+  const moveStyle = { color: '#16a34a' };
 
   return (
-    <div className={`grid grid-cols-2 border-b border-gray-100 ${bg[line.type]}`}>
+    <div className={`grid grid-cols-2 border-b border-gray-100 ${bg[line.type] || ''}`}>
       <div className="flex">
         <span className="w-10 text-right pr-2 text-gray-400 text-xs leading-6 select-none flex-shrink-0">
           {line.left_num || ''}
         </span>
-        <span className={`flex-1 px-2 py-0.5 whitespace-pre-wrap break-all ${line.type === 'delete' ? 'bg-red-100' : line.type === 'replace' ? 'bg-red-50' : ''}`}>
+        <span className={`flex-1 px-2 py-0.5 whitespace-pre-wrap break-all ${
+          line.type === 'delete' ? 'bg-red-100' : line.type === 'replace' ? 'bg-red-50' : ''
+        }`}>
           {line.type === 'replace' && line.inline_diff ? (
             <InlineHighlight tokens={line.inline_diff} side="old" text={line.left_text} />
+          ) : isMoveOut ? (
+            <span style={{ ...moveStyle, textDecoration: 'line-through' }} title={`Verschoben (ID ${line.moveId})`}>
+              {line.left_text}
+            </span>
           ) : showFormatted && line.left_html ? (
             <FormattedText html={line.left_html} fallback={line.left_text} />
           ) : line.left_text}
@@ -594,9 +605,15 @@ function DiffLine({ line, viewMode }) {
         <span className="w-10 text-right pr-2 text-gray-400 text-xs leading-6 select-none flex-shrink-0">
           {line.right_num || ''}
         </span>
-        <span className={`flex-1 px-2 py-0.5 whitespace-pre-wrap break-all ${line.type === 'insert' ? 'bg-green-100' : line.type === 'replace' ? 'bg-green-50' : ''}`}>
+        <span className={`flex-1 px-2 py-0.5 whitespace-pre-wrap break-all ${
+          line.type === 'insert' ? 'bg-green-100' : line.type === 'replace' ? 'bg-green-50' : ''
+        }`}>
           {line.type === 'replace' && line.inline_diff ? (
             <InlineHighlight tokens={line.inline_diff} side="new" text={line.right_text} />
+          ) : isMoveIn ? (
+            <span style={{ ...moveStyle, textDecoration: 'underline' }} title={`Verschoben (ID ${line.moveId})`}>
+              {line.right_text}
+            </span>
           ) : showFormatted && line.right_html ? (
             <FormattedText html={line.right_html} fallback={line.right_text} />
           ) : line.right_text}
@@ -609,19 +626,43 @@ function DiffLine({ line, viewMode }) {
 function InlineHighlight({ tokens, side, text }) {
   if (!tokens || tokens.length === 0) return <>{text}</>;
 
+  // Full-context format (includes 'equal' segments) → render all tokens with context
+  if (tokens.some(t => t.type === 'equal')) {
+    return (
+      <>
+        {tokens.map((seg, i) => {
+          if (seg.type === 'equal') {
+            return <span key={i}>{(side === 'old' ? seg.old_tokens : seg.new_tokens).join('')}</span>;
+          }
+          if (side === 'old' && (seg.type === 'delete' || seg.type === 'replace')) {
+            return (
+              <span key={i} className="bg-red-200 rounded px-0.5 line-through text-red-800">
+                {(seg.old_tokens || []).join('')}
+              </span>
+            );
+          }
+          if (side === 'new' && (seg.type === 'insert' || seg.type === 'replace')) {
+            return (
+              <span key={i} className="bg-green-200 rounded px-0.5 underline text-green-800">
+                {(seg.new_tokens || []).join('')}
+              </span>
+            );
+          }
+          // delete token on new side or insert token on old side: render nothing
+          return null;
+        })}
+      </>
+    );
+  }
+
+  // Legacy format: only changed tokens (no equal), fall back to highlighted parts
   const parts = [];
   let i = 0;
   for (const tok of tokens) {
-    const oldToks = tok.old_tokens || [];
-    const newToks = tok.new_tokens || [];
-    if (side === 'old') {
-      for (const t of oldToks) {
-        parts.push(<span key={i++} className="bg-red-300 rounded px-0.5">{t}</span>);
-      }
-    } else {
-      for (const t of newToks) {
-        parts.push(<span key={i++} className="bg-green-300 rounded px-0.5">{t}</span>);
-      }
+    const toks = side === 'old' ? (tok.old_tokens || []) : (tok.new_tokens || []);
+    const cls = side === 'old' ? 'bg-red-300 rounded px-0.5' : 'bg-green-300 rounded px-0.5';
+    for (const t of toks) {
+      parts.push(<span key={i++} className={cls}>{t}</span>);
     }
   }
   return parts.length > 0 ? <>{parts}</> : <>{text}</>;
