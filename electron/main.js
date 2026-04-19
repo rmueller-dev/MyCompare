@@ -12,6 +12,14 @@ let serverPort = null;
 // Path to the project root (one level up from electron/)
 const PROJECT_ROOT = path.join(__dirname, '..');
 
+// Path to the bundled backend binary
+function getBackendBinary() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'backend', 'mycompare-backend');
+  }
+  return path.join(PROJECT_ROOT, 'dist', 'mycompare-backend', 'mycompare-backend');
+}
+
 // ---------------------------------------------------------------------------
 // Find a free port
 // ---------------------------------------------------------------------------
@@ -59,42 +67,24 @@ function waitForServer(port, retries = 60, delay = 500) {
 }
 
 // ---------------------------------------------------------------------------
-// Start the Flask/gunicorn backend
+// Start the bundled backend binary
 // ---------------------------------------------------------------------------
 async function startBackend() {
   serverPort = await findFreePort();
 
-  const venvPython = path.join(PROJECT_ROOT, 'venv', 'bin', 'python');
-  const gunicorn = path.join(PROJECT_ROOT, 'venv', 'bin', 'gunicorn');
-
-  // Check if venv exists
+  const backendBin = getBackendBinary();
   const fs = require('fs');
-  if (!fs.existsSync(venvPython)) {
+  if (!fs.existsSync(backendBin)) {
     dialog.showErrorBox(
       'MyCompare — Fehler',
-      'Python Virtual Environment nicht gefunden.\n\n' +
-      'Bitte zuerst im Terminal ausführen:\n' +
-      `cd "${PROJECT_ROOT}" && bash start.sh\n\n` +
-      'Danach die App erneut starten.'
+      `Backend-Binary nicht gefunden:\n${backendBin}\n\n` +
+      'Bitte neu bauen: cd <repo> && bash build-mac-app.sh'
     );
     app.quit();
     return;
   }
 
-  // Start gunicorn
-  backendProcess = spawn(gunicorn, [
-    '--bind', `127.0.0.1:${serverPort}`,
-    '--workers', '2',
-    '--timeout', '3600',
-    '--access-logfile', '-',
-    'app.main:create_app()',
-  ], {
-    cwd: PROJECT_ROOT,
-    env: {
-      ...process.env,
-      PATH: path.join(PROJECT_ROOT, 'venv', 'bin') + ':' + process.env.PATH,
-      VIRTUAL_ENV: path.join(PROJECT_ROOT, 'venv'),
-    },
+  backendProcess = spawn(backendBin, ['--port', String(serverPort), '--host', '127.0.0.1'], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -246,8 +236,7 @@ app.on('ready', async () => {
     dialog.showErrorBox(
       'MyCompare — Fehler',
       `Server konnte nicht gestartet werden:\n${err.message}\n\n` +
-      'Bitte stelle sicher, dass alle Abhängigkeiten installiert sind:\n' +
-      `cd "${PROJECT_ROOT}" && bash start.sh`
+      'Bitte das App-Bundle neu installieren oder support@mycompare.app kontaktieren.'
     );
     app.quit();
   }

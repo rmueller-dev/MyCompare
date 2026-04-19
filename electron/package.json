@@ -28,29 +28,17 @@
       "target": [
         {
           "target": "dmg",
-          "arch": ["universal"]
+          "arch": ["arm64"]
         }
       ],
-      "hardenedRuntime": false
+      "hardenedRuntime": false,
+      "identity": null
     },
     "extraResources": [
       {
-        "from": "../app",
-        "to": "app",
-        "filter": ["**/*", "!__pycache__/**"]
-      },
-      {
-        "from": "../frontend/build",
-        "to": "frontend/build",
+        "from": "../dist/mycompare-backend",
+        "to": "backend",
         "filter": ["**/*"]
-      },
-      {
-        "from": "../requirements.txt",
-        "to": "requirements.txt"
-      },
-      {
-        "from": "../start.sh",
-        "to": "start.sh"
       }
     ],
     "dmg": {
